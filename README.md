@@ -20,8 +20,9 @@ make
 ```
 
 Keys: arrows select an item, `Enter` opens a directory, `Backspace` goes up,
-and `q` exits. Symlinks are skipped and inaccessible directories are shown as
-empty entries rather than crashing the scan.
+and `q` exits. Very small files are combined into an `other` box to keep the
+treemap readable. Symlinks are skipped and inaccessible directories are shown
+as empty entries rather than crashing the scan.
 
 The current V1 deliberately focuses on correctness and a dependable core.
 Duplicate detection and richer visualization are planned for V2.
