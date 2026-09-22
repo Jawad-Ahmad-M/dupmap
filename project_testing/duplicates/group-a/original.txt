@@ -1,0 +1,2 @@
+This file is intentionally duplicated three times.
+The contents must remain byte-for-byte identical.

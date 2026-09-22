@@ -1,0 +1,1 @@
+This path tests nested directories, spaces, and filename truncation.
