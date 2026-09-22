@@ -37,9 +37,9 @@ static void test_scan_aggregates_and_groups(void) {
     write_bytes(path, 3, 0xB);
     snprintf(path, sizeof(path), "%s/nested", root_path);
     make_dir(path);
-    char nested_path[PATH_MAX];
-    snprintf(nested_path, sizeof(nested_path), "%s/data.bin", path);
+    char *nested_path = join_path(path, "data.bin");
     write_bytes(nested_path, 6000, 0xC);
+    free(nested_path);
     snprintf(path, sizeof(path), "%s/empty", root_path);
     make_dir(path);
     snprintf(path, sizeof(path), "%s/link-to-large", root_path);
