@@ -7,7 +7,12 @@ dupmap: src/main.c
 	@mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(LDLIBS)
 
-clean:
-	rm -f dupmap
+test: tests/test_core.c
+	@mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o build/test_core $< $(LDLIBS)
+	./build/test_core
 
-.PHONY: clean
+clean:
+	rm -f dupmap build/test_core
+
+.PHONY: clean test

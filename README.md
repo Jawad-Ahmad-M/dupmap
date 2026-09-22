@@ -13,6 +13,12 @@ sudo apt install build-essential libncurses-dev
 make
 ```
 
+Run the automated core tests with:
+
+```sh
+make test
+```
+
 ## Run
 
 ```sh
