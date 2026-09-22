@@ -54,7 +54,9 @@ static void test_scan_aggregates_and_groups(void) {
     assert(child_named(root, "empty"));
     assert(child_named(root, "link-to-large") == NULL);
     Node *other = child_named(root, "other");
-    assert(other && !other->is_dir && other->size == 3);
+    assert(other && other->is_dir && other->size == 3);
+    assert(child_named(other, "tiny.txt"));
+    assert(child_named(other, "tiny.txt")->parent == other);
     Node *nested = child_named(root, "nested");
     assert(nested->size == 6000);
     assert(child_named(nested, "data.bin"));

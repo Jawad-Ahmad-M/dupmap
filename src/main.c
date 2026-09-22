@@ -101,26 +101,28 @@ static Node *scan_path(const char *path, const char *display_name, int is_root) 
     /* Keep tiny files from producing unreadable one-cell boxes. Directories
        are never grouped because they must remain independently navigable. */
     const off_t tiny_limit = 4096;
-    off_t other_size = 0;
     Node **kept = malloc(dir->child_cap * sizeof(*kept));
-    if (!kept) die("out of memory");
-    size_t kept_count = 0;
+    Node **tiny = malloc(dir->child_cap * sizeof(*tiny));
+    if (!kept || !tiny) die("out of memory");
+    size_t kept_count = 0, tiny_count = 0;
     for (size_t i = 0; i < dir->child_count; ++i) {
         Node *child = dir->children[i];
         if (!child->is_dir && child->size < tiny_limit) {
-            other_size += child->size;
-            free_node(child);
+            tiny[tiny_count++] = child;
         } else kept[kept_count++] = child;
     }
     free(dir->children);
     dir->children = NULL; dir->child_count = 0; dir->child_cap = 0; dir->size = 0;
     for (size_t i = 0; i < kept_count; ++i) add_child(dir, kept[i]);
     free(kept);
-    if (other_size > 0) {
-        Node *other = new_node("other", path, 0);
-        other->size = other_size;
+    if (tiny_count > 0) {
+        char *other_path = join_path(path, "other");
+        Node *other = new_node("other", other_path, 1);
+        free(other_path);
+        for (size_t i = 0; i < tiny_count; ++i) add_child(other, tiny[i]);
         add_child(dir, other);
     }
+    free(tiny);
     if (dir->child_count) qsort(dir->children, dir->child_count, sizeof(*dir->children), compare_nodes);
     (void)is_root;
     return dir;
