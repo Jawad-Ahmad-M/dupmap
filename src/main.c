@@ -151,9 +151,12 @@ static void layout_children(Node *parent, int x, int y, int w, int h, BoxList *b
             if (worst <= best || end == start) { best = worst; best_end = end; ++end; }
             else break;
         }
-        int row_size = horizontal ? (int)(row_area / side + 0.5) : (int)(row_area / side + 0.5);
+        /* A horizontal row spans the available width and consumes height;
+           a vertical row spans height and consumes width. */
+        double cross_side = horizontal ? width : height;
+        int row_size = (int)(row_area / cross_side + 0.5);
         if (row_size < 1) row_size = 1;
-        if (row_size > (horizontal ? width : height)) row_size = horizontal ? width : height;
+        if (row_size > (horizontal ? height : width)) row_size = horizontal ? height : width;
         int cursor = horizontal ? left : top;
         double actual_row = 0;
         for (size_t i = start; i <= best_end; ++i) actual_row += (double)parent->children[i]->size / (double)remaining_size * remaining_area;
@@ -165,8 +168,8 @@ static void layout_children(Node *parent, int x, int y, int w, int h, BoxList *b
             if (horizontal) { add_box(boxes, cursor, top, length, row_size, child); cursor += length; }
             else { add_box(boxes, left, cursor, row_size, length, child); cursor += length; }
         }
-        if (horizontal) { left += row_size; width -= row_size; }
-        else { top += row_size; height -= row_size; }
+        if (horizontal) { top += row_size; height -= row_size; }
+        else { left += row_size; width -= row_size; }
         start = best_end + 1;
     }
 }
