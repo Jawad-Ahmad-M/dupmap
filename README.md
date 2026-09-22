@@ -1,0 +1,27 @@
+# dupmap
+
+`dupmap` is a small terminal disk-usage visualizer. It scans a directory, shows
+its contents as a treemap, and lets you navigate into folders without leaving
+the terminal.
+
+## Build
+
+On Debian/Ubuntu/WSL:
+
+```sh
+sudo apt install build-essential libncurses-dev
+make
+```
+
+## Run
+
+```sh
+./dupmap [path]
+```
+
+Keys: arrows select an item, `Enter` opens a directory, `Backspace` goes up,
+and `q` exits. Symlinks are skipped and inaccessible directories are shown as
+empty entries rather than crashing the scan.
+
+The current V1 deliberately focuses on correctness and a dependable core.
+Duplicate detection and richer visualization are planned for V2.
