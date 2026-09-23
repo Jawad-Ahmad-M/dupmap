@@ -285,14 +285,32 @@ static void draw_box(const Box *box, int selected, int depth) {
     int color = depth_color(depth);
     attron(COLOR_PAIR(color));
     for (int row = box->y; row < box->y + box->h; ++row) {
-        for (int col = box->x; col < box->x + box->w; ++col) mvaddch(row, col, ' ' | COLOR_PAIR(color));
+        for (int col = box->x; col < box->x + box->w; ++col) mvaddch(row, col, ' ');
     }
+
+    int has_border = box->w >= 2 && box->h >= 2;
     if (selected) attron(A_REVERSE | A_BOLD);
-    if (box->w >= 3 && box->h >= 1) {
-        int max = box->w - 1; char label[256];
+    if (has_border) {
+        mvaddch(box->y, box->x, ACS_ULCORNER);
+        mvaddch(box->y, box->x + box->w - 1, ACS_URCORNER);
+        mvaddch(box->y + box->h - 1, box->x, ACS_LLCORNER);
+        mvaddch(box->y + box->h - 1, box->x + box->w - 1, ACS_LRCORNER);
+        for (int col = box->x + 1; col < box->x + box->w - 1; ++col) {
+            mvaddch(box->y, col, ACS_HLINE);
+            mvaddch(box->y + box->h - 1, col, ACS_HLINE);
+        }
+        for (int row = box->y + 1; row < box->y + box->h - 1; ++row) {
+            mvaddch(row, box->x, ACS_VLINE);
+            mvaddch(row, box->x + box->w - 1, ACS_VLINE);
+        }
+    }
+    if (box->w >= (has_border ? 4 : 3) && box->h >= (has_border ? 3 : 1)) {
+        int start_x = box->x + (has_border ? 1 : 0);
+        int label_row = box->y + (has_border ? 1 : 0);
+        int max = box->w - (has_border ? 2 : 1); char label[256];
         snprintf(label, sizeof(label), "%s", box->node->name);
         if ((int)strlen(label) > max) { if (max > 3) { label[max - 3] = '.'; label[max - 2] = '.'; label[max - 1] = '.'; label[max] = '\0'; } else label[max] = '\0'; }
-        mvaddnstr(box->y, box->x, label, max);
+        mvaddnstr(label_row, start_x, label, max);
     }
     attroff(A_REVERSE | A_BOLD); attroff(COLOR_PAIR(color));
 }

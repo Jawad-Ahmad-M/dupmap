@@ -4,6 +4,10 @@
 its contents as a treemap, and lets you navigate into folders without leaving
 the terminal.
 
+The treemap uses bordered, color-coded boxes with a clear selected-box state.
+Use the list view whenever a directory contains more items than can fit
+readably in the available terminal space.
+
 ## Build
 
 On Debian/Ubuntu/WSL:
