@@ -322,26 +322,47 @@ int main(int argc, char **argv) {
 
     initscr(); cbreak(); noecho(); keypad(stdscr, TRUE); curs_set(0); start_color(); use_default_colors();
     for (int i = 1; i <= 6; ++i) init_pair(i, i, -1);
-    Node *current = root; size_t selected = 0;
+    Node *current = root; size_t selected = 0; int list_mode = 0;
     for (;;) {
         int rows, cols; getmaxyx(stdscr, rows, cols); erase();
         char size_text[32]; format_size(current->size, size_text, sizeof(size_text));
         mvprintw(0, 0, "dupmap  %s  | %s", current->path, size_text);
-        mvprintw(1, 0, "Arrows: select  Enter: open  Backspace: up  q: quit");
+        mvprintw(1, 0, "Arrows: select  Enter: open  Backspace: up  l: list  q: quit");
         BoxList boxes = {0}; layout_children(current, 0, 2, cols, rows - 4, &boxes);
-        if (selected >= boxes.count && boxes.count) selected = boxes.count - 1;
-        for (size_t i = 0; i < boxes.count; ++i) draw_box(&boxes.items[i], i == selected, 0);
-        if (boxes.count) {
-            char selected_size[32]; format_size(boxes.items[selected].node->size, selected_size, sizeof(selected_size));
-            mvprintw(rows - 2, 0, "%s  (%s)%s", boxes.items[selected].node->path, selected_size,
-                     boxes.items[selected].node->inaccessible ? " [permission denied]" : "");
+        Node *selected_node = NULL;
+        if (list_mode) {
+            if (selected >= current->child_count && current->child_count) selected = current->child_count - 1;
+            int list_rows = rows - 5;
+            if (list_rows < 1) list_rows = 1;
+            size_t first = selected >= (size_t)list_rows ? selected - (size_t)list_rows + 1 : 0;
+            mvprintw(2, 0, "Contents (%zu items):", current->child_count);
+            for (size_t i = first; i < current->child_count && (int)(i - first) < list_rows; ++i) {
+                Node *item = current->children[i]; char item_size[32]; format_size(item->size, item_size, sizeof(item_size));
+                int name_width = cols > 28 ? cols - 25 : 1;
+                mvprintw(3 + (int)(i - first), 0, "%c %-*.*s %10s  %s%s", i == selected ? '>' : ' ', name_width, name_width,
+                         item->name, item_size, item->is_dir ? "directory" : "file", item->inaccessible ? " [permission denied]" : "");
+            }
+            if (current->child_count) selected_node = current->children[selected];
+        } else {
+            if (selected >= boxes.count && boxes.count) selected = boxes.count - 1;
+            for (size_t i = 0; i < boxes.count; ++i) draw_box(&boxes.items[i], i == selected, 0);
+            if (boxes.count) selected_node = boxes.items[selected].node;
+        }
+        if (selected_node) {
+            char selected_size[32]; format_size(selected_node->size, selected_size, sizeof(selected_size));
+            mvprintw(rows - 2, 0, "%s  (%s)%s", selected_node->path, selected_size,
+                     selected_node->inaccessible ? " [permission denied]" : "");
         } else mvprintw(rows - 2, 0, "%s  (empty or inaccessible)", current->path);
         refresh();
         int key = getch();
         if (key == 'q' || key == 'Q') { free(boxes.items); break; }
-        if (key == KEY_LEFT || key == KEY_UP) { if (selected) --selected; }
-        else if (key == KEY_RIGHT || key == KEY_DOWN) { if (selected + 1 < boxes.count) ++selected; }
-        else if ((key == '\n' || key == KEY_ENTER) && boxes.count && boxes.items[selected].node->is_dir && !boxes.items[selected].node->inaccessible) { current = boxes.items[selected].node; selected = 0; }
+        if (key == 'l' || key == 'L') { list_mode = !list_mode; selected = 0; }
+        else if (list_mode && (key == KEY_LEFT || key == KEY_UP)) { if (selected) --selected; }
+        else if (list_mode && (key == KEY_RIGHT || key == KEY_DOWN)) { if (selected + 1 < current->child_count) ++selected; }
+        else if (list_mode && (key == '\n' || key == KEY_ENTER) && selected_node && selected_node->is_dir && !selected_node->inaccessible) { current = selected_node; selected = 0; }
+        else if (!list_mode && (key == KEY_LEFT || key == KEY_UP)) { if (selected) --selected; }
+        else if (!list_mode && (key == KEY_RIGHT || key == KEY_DOWN)) { if (selected + 1 < boxes.count) ++selected; }
+        else if (!list_mode && (key == '\n' || key == KEY_ENTER) && selected_node && selected_node->is_dir && !selected_node->inaccessible) { current = selected_node; selected = 0; }
         else if ((key == KEY_BACKSPACE || key == 127 || key == 8) && current != root) {
             current = current->parent; selected = 0;
         }
