@@ -73,3 +73,15 @@ sudo cmake --install build-cmake
 When launched without an explicit path, dupmap remembers the last directory,
 sort mode, color mode, and view mode in `${XDG_STATE_HOME:-~/.config}/dupmap/state`.
 The state file is optional and failures to write it do not affect scanning.
+
+## Release
+
+Linux release archives are built automatically when a `v*` tag is pushed. To
+publish the current version from a maintainer checkout:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full test and development loop.
