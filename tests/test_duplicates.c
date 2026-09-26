@@ -27,9 +27,11 @@ int main(void) {
     Node *root = scan_path(root_path, root_path, 1); assert(root);
     DuplicateGroup *groups = NULL; size_t count = find_duplicate_groups(root, &groups);
     assert(count == 1); assert(groups[0].count == 2); assert(groups[0].size == 14);
-    assert(child_named(root, "a.txt")->is_duplicate);
-    assert(child_named(root, "b.txt")->is_duplicate);
-    assert(!child_named(root, "different.txt")->is_duplicate);
+    Node *other = child_named(root, "other");
+    assert(other && other->is_dir);
+    assert(child_named(other, "a.txt") && child_named(other, "a.txt")->is_duplicate);
+    assert(child_named(other, "b.txt") && child_named(other, "b.txt")->is_duplicate);
+    assert(child_named(other, "different.txt") && !child_named(other, "different.txt")->is_duplicate);
     free_duplicate_groups(groups, count); free_node(root);
     unlink(a); unlink(b); unlink(different); rmdir(root_path);
     puts("duplicate tests: all passed"); return 0;
