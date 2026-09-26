@@ -45,7 +45,8 @@ crashing the scan.
 
 The current V1 deliberately focuses on correctness and a dependable core.
 Duplicate detection is available through `--dupes`; richer in-treemap duplicate
-highlighting and additional display modes are planned for the next release.
+highlighting is shown with red borders in normal mode. Additional display modes
+are planned for the next release.
 
 ## Install the man page
 

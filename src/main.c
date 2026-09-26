@@ -22,6 +22,7 @@ struct Node {
     off_t size;
     int is_dir;
     int inaccessible;
+    int is_duplicate;
     Node **children;
     size_t child_count;
     size_t child_cap;
@@ -139,6 +140,7 @@ static size_t find_duplicate_groups(Node *root, DuplicateGroup **out) {
             matches[match_count++] = files.items[j]; used[j] = 1;
         }
         if (match_count > 1) {
+            for (size_t j = 0; j < match_count; ++j) matches[j]->is_duplicate = 1;
             if (count == cap) {
                 size_t next = cap ? cap * 2 : 8;
                 DuplicateGroup *grown = realloc(groups, next * sizeof(*grown));
@@ -284,7 +286,7 @@ static void layout_children(Node *parent, int x, int y, int w, int h, BoxList *b
 static int depth_color(int depth) { return 1 + (depth % 6); }
 
 static void draw_box(const Box *box, int selected, int depth) {
-    int color = depth_color(depth);
+    int color = box->node->is_duplicate ? 7 : depth_color(depth);
     attron(COLOR_PAIR(color));
     for (int row = box->y; row < box->y + box->h; ++row) {
         for (int col = box->x; col < box->x + box->w; ++col) mvaddch(row, col, ' ');
@@ -354,14 +356,17 @@ int main(int argc, char **argv) {
         free_duplicate_groups(groups, group_count); free_node(root); return EXIT_SUCCESS;
     }
 
+    DuplicateGroup *duplicate_groups = NULL;
+    size_t duplicate_group_count = find_duplicate_groups(root, &duplicate_groups);
     initscr(); cbreak(); noecho(); keypad(stdscr, TRUE); curs_set(0); start_color(); use_default_colors();
     for (int i = 1; i <= 6; ++i) init_pair(i, i, -1);
+    init_pair(7, COLOR_RED, -1);
     Node *current = root; size_t selected = 0; int list_mode = 0;
     for (;;) {
         int rows, cols; getmaxyx(stdscr, rows, cols); erase();
         char size_text[32]; format_size(current->size, size_text, sizeof(size_text));
         mvprintw(0, 0, "dupmap  %s  | %s", current->path, size_text);
-        mvprintw(1, 0, "Arrows: select  Enter: open  Backspace: up  l: list  q: quit");
+        mvprintw(1, 0, "Arrows: select  Enter: open  Backspace: up  l: list  q: quit  * duplicate");
         BoxList boxes = {0}; layout_children(current, 0, 2, cols, rows - 4, &boxes);
         Node *selected_node = NULL;
         if (list_mode) {
@@ -402,5 +407,5 @@ int main(int argc, char **argv) {
         }
         free(boxes.items);
     }
-    endwin(); free_node(root); return EXIT_SUCCESS;
+    endwin(); free_duplicate_groups(duplicate_groups, duplicate_group_count); free_node(root); return EXIT_SUCCESS;
 }
