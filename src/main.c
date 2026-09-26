@@ -388,7 +388,8 @@ static int load_state(char *last_path, size_t path_length, int *saved_sort, int 
     if (!file) return 0;
     if (!fgets(last_path, (int)path_length, file)) { fclose(file); return 0; }
     last_path[strcspn(last_path, "\r\n")] = '\0';
-    (void)fscanf(file, "%d %d %d", saved_sort, saved_color, saved_list);
+    int parsed = fscanf(file, "%d %d %d", saved_sort, saved_color, saved_list);
+    if (parsed != 3) { *saved_sort = 0; *saved_color = 0; *saved_list = 0; }
     fclose(file);
     struct stat st;
     return *last_path && stat(last_path, &st) == 0 && S_ISDIR(st.st_mode);
@@ -404,7 +405,10 @@ static void save_state(const char *last_path, int saved_sort, int saved_color, i
         snprintf(state_dir, sizeof(state_dir), "%s/.config/dupmap", home);
     }
     if (mkdir(state_dir, 0700) != 0 && errno != EEXIST) return;
-    snprintf(state_path, sizeof(state_path), "%s/state", state_dir);
+    size_t directory_length = strlen(state_dir);
+    if (directory_length + strlen("/state") >= sizeof(state_path)) return;
+    memcpy(state_path, state_dir, directory_length);
+    memcpy(state_path + directory_length, "/state", strlen("/state") + 1);
     FILE *file = fopen(state_path, "w");
     if (!file) return;
     fprintf(file, "%s\n%d %d %d\n", last_path, saved_sort, saved_color, saved_list);

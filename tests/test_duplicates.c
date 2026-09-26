@@ -10,6 +10,12 @@ static void put_file(const char *path, const char *text) {
     fclose(file);
 }
 
+static Node *child_named(Node *parent, const char *name) {
+    for (size_t i = 0; i < parent->child_count; ++i)
+        if (!strcmp(parent->children[i]->name, name)) return parent->children[i];
+    return NULL;
+}
+
 int main(void) {
     char root_path[] = "/tmp/dupmap-dupes-XXXXXX";
     assert(mkdtemp(root_path));
