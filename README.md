@@ -38,7 +38,8 @@ To list duplicate files and estimated reclaimable space:
 ```
 
 Keys: arrows select an item, `Enter` opens a directory, `Backspace` goes up,
-`l` toggles a complete list view, and `q` exits. Very small files are combined into an `other` folder to keep the
+`l` toggles a complete list view, `s` cycles size/name/modified sorting, `c`
+cycles depth/file-type/size-heat colors, and `q` exits. Very small files are combined into an `other` folder to keep the
 treemap readable; press Enter on it to inspect those files. Symlinks are
 skipped and inaccessible directories are shown as empty entries rather than
 crashing the scan.

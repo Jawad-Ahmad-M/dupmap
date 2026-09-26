@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <stdint.h>
+#include <time.h>
 #include <unistd.h>
 
 #define DUPMAP_VERSION "0.1.0"
@@ -23,6 +24,7 @@ struct Node {
     int is_dir;
     int inaccessible;
     int is_duplicate;
+    time_t modified;
     Node **children;
     size_t child_count;
     size_t child_cap;
@@ -31,6 +33,8 @@ struct Node {
 typedef struct { int x, y, w, h; Node *node; } Box;
 typedef struct { Box *items; size_t count, cap; } BoxList;
 typedef struct { Node **files; size_t count; off_t size; } DuplicateGroup;
+static int sort_mode = 0; /* 0 size, 1 name, 2 modified */
+static int color_mode = 0; /* 0 depth, 1 file type, 2 size heat */
 
 static void die(const char *message) { endwin(); fprintf(stderr, "dupmap: %s\n", message); exit(EXIT_FAILURE); }
 
@@ -74,6 +78,12 @@ static void add_child(Node *parent, Node *child) {
 
 static int compare_nodes(const void *a, const void *b) {
     const Node *left = *(const Node * const *)a, *right = *(const Node * const *)b;
+    if (sort_mode == 1) return strcasecmp(left->name, right->name);
+    if (sort_mode == 2) {
+        if (left->modified < right->modified) return 1;
+        if (left->modified > right->modified) return -1;
+        return strcasecmp(left->name, right->name);
+    }
     if (left->size < right->size) return 1;
     if (left->size > right->size) return -1;
     return strcasecmp(left->name, right->name);
@@ -165,10 +175,12 @@ static Node *scan_path(const char *path, const char *display_name, int is_root) 
     if (!S_ISDIR(st.st_mode)) {
         Node *file = new_node(display_name, path, 0);
         file->size = st.st_size;
+        file->modified = st.st_mtime;
         return file;
     }
 
     Node *dir = new_node(display_name, path, 1);
+    dir->modified = st.st_mtime;
     DIR *handle = opendir(path);
     if (!handle) { dir->inaccessible = 1; return dir; }
     struct dirent *entry;
@@ -285,8 +297,32 @@ static void layout_children(Node *parent, int x, int y, int w, int h, BoxList *b
 
 static int depth_color(int depth) { return 1 + (depth % 6); }
 
+static int type_color(const Node *node) {
+    if (node->is_dir) return 6;
+    const char *dot = strrchr(node->name, '.');
+    if (!dot) return 5;
+    if (!strcasecmp(dot, ".c") || !strcasecmp(dot, ".h") || !strcasecmp(dot, ".cpp") || !strcasecmp(dot, ".py") || !strcasecmp(dot, ".js")) return 4;
+    if (!strcasecmp(dot, ".jpg") || !strcasecmp(dot, ".jpeg") || !strcasecmp(dot, ".png") || !strcasecmp(dot, ".gif") || !strcasecmp(dot, ".mp4")) return 2;
+    if (!strcasecmp(dot, ".zip") || !strcasecmp(dot, ".gz") || !strcasecmp(dot, ".tar") || !strcasecmp(dot, ".7z")) return 3;
+    return 5;
+}
+
+static int heat_color(const Node *node) {
+    if (node->size >= (off_t)1024 * 1024 * 1024) return 1;
+    if (node->size >= (off_t)1024 * 1024) return 3;
+    if (node->size >= (off_t)1024) return 5;
+    return 6;
+}
+
+static int node_color(const Node *node, int depth) {
+    if (node->is_duplicate) return 7;
+    if (color_mode == 1) return type_color(node);
+    if (color_mode == 2) return heat_color(node);
+    return depth_color(depth);
+}
+
 static void draw_box(const Box *box, int selected, int depth) {
-    int color = box->node->is_duplicate ? 7 : depth_color(depth);
+    int color = node_color(box->node, depth);
     attron(COLOR_PAIR(color));
     for (int row = box->y; row < box->y + box->h; ++row) {
         for (int col = box->x; col < box->x + box->w; ++col) mvaddch(row, col, ' ');
@@ -325,6 +361,14 @@ static void format_size(off_t value, char *out, size_t length) {
     snprintf(out, length, unit ? "%.1f %s" : "%.0f %s", size, units[unit]);
 }
 
+static const char *sort_name(void) {
+    return sort_mode == 1 ? "name" : (sort_mode == 2 ? "modified" : "size");
+}
+
+static const char *color_name(void) {
+    return color_mode == 1 ? "type" : (color_mode == 2 ? "heat" : "depth");
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
         printf("Usage: dupmap [options] [path]\n\n"
@@ -333,7 +377,7 @@ int main(int argc, char **argv) {
                "  -h, --help      show this help\n"
                "  -v, --version   show version\n\n"
                "Interactive keys: arrows select, Enter opens, Backspace goes up,\n"
-               "l toggles the complete list view, q quits.\n");
+               "l toggles the complete list view, s cycles sorting, c cycles colors, q quits.\n");
         return EXIT_SUCCESS;
     }
     if (argc > 1 && (!strcmp(argv[1], "--version") || !strcmp(argv[1], "-v"))) {
@@ -366,7 +410,7 @@ int main(int argc, char **argv) {
         int rows, cols; getmaxyx(stdscr, rows, cols); erase();
         char size_text[32]; format_size(current->size, size_text, sizeof(size_text));
         mvprintw(0, 0, "dupmap  %s  | %s", current->path, size_text);
-        mvprintw(1, 0, "Arrows: select  Enter: open  Backspace: up  l: list  q: quit  * duplicate");
+        mvprintw(1, 0, "Arrows select  Enter open  Backspace up  l:list  s:sort(%s)  c:color(%s)  q:quit  * duplicate", sort_name(), color_name());
         BoxList boxes = {0}; layout_children(current, 0, 2, cols, rows - 4, &boxes);
         Node *selected_node = NULL;
         if (list_mode) {
@@ -396,6 +440,8 @@ int main(int argc, char **argv) {
         int key = getch();
         if (key == 'q' || key == 'Q') { free(boxes.items); break; }
         if (key == 'l' || key == 'L') { list_mode = !list_mode; selected = 0; }
+        else if (key == 's' || key == 'S') { sort_mode = (sort_mode + 1) % 3; if (current->child_count) qsort(current->children, current->child_count, sizeof(*current->children), compare_nodes); selected = 0; }
+        else if (key == 'c' || key == 'C') { color_mode = (color_mode + 1) % 3; }
         else if (list_mode && (key == KEY_LEFT || key == KEY_UP)) { if (selected) --selected; }
         else if (list_mode && (key == KEY_RIGHT || key == KEY_DOWN)) { if (selected + 1 < current->child_count) ++selected; }
         else if (list_mode && (key == '\n' || key == KEY_ENTER) && selected_node && selected_node->is_dir && !selected_node->inaccessible) { current = selected_node; selected = 0; }
