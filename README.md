@@ -55,3 +55,17 @@ are planned for the next release.
 sudo install -Dm644 dupmap.1 /usr/local/share/man/man1/dupmap.1
 man dupmap
 ```
+
+To install the program and man page together:
+
+```sh
+sudo make install
+```
+
+The project also supports CMake:
+
+```sh
+cmake -S . -B build-cmake
+cmake --build build-cmake
+sudo cmake --install build-cmake
+```
