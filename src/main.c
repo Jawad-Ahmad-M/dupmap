@@ -1,5 +1,6 @@
 #define _DEFAULT_SOURCE
 #include <dirent.h>
+#include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <ncurses.h>
@@ -369,6 +370,27 @@ static const char *color_name(void) {
     return color_mode == 1 ? "type" : (color_mode == 2 ? "heat" : "depth");
 }
 
+static int name_matches(const char *name, const char *query) {
+    if (!query[0]) return 1;
+    for (const char *start = name; *start; ++start) {
+        const char *a = start, *b = query;
+        while (*a && *b && tolower((unsigned char)*a) == tolower((unsigned char)*b)) { ++a; ++b; }
+        if (!*b) return 1;
+    }
+    return 0;
+}
+
+static size_t next_match(Node *parent, size_t selected, int direction, const char *query) {
+    if (!parent->child_count) return 0;
+    size_t index = selected;
+    for (size_t step = 0; step < parent->child_count; ++step) {
+        if (direction > 0) index = (index + 1) % parent->child_count;
+        else index = index ? index - 1 : parent->child_count - 1;
+        if (name_matches(parent->children[index]->name, query)) return index;
+    }
+    return selected;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
         printf("Usage: dupmap [options] [path]\n\n"
@@ -377,7 +399,8 @@ int main(int argc, char **argv) {
                "  -h, --help      show this help\n"
                "  -v, --version   show version\n\n"
                "Interactive keys: arrows select, Enter opens, Backspace goes up,\n"
-               "l toggles the complete list view, s cycles sorting, c cycles colors, q quits.\n");
+               "l toggles the complete list view, f filters names, s cycles sorting,\n"
+               "c cycles colors, q quits.\n");
         return EXIT_SUCCESS;
     }
     if (argc > 1 && (!strcmp(argv[1], "--version") || !strcmp(argv[1], "-v"))) {
@@ -405,27 +428,32 @@ int main(int argc, char **argv) {
     initscr(); cbreak(); noecho(); keypad(stdscr, TRUE); curs_set(0); start_color(); use_default_colors();
     for (int i = 1; i <= 6; ++i) init_pair(i, i, -1);
     init_pair(7, COLOR_RED, -1);
-    Node *current = root; size_t selected = 0; int list_mode = 0;
+    Node *current = root; size_t selected = 0; int list_mode = 0; char filter[256] = "";
     for (;;) {
         int rows, cols; getmaxyx(stdscr, rows, cols); erase();
         char size_text[32]; format_size(current->size, size_text, sizeof(size_text));
         mvprintw(0, 0, "dupmap  %s  | %s", current->path, size_text);
-        mvprintw(1, 0, "Arrows select  Enter open  Backspace up  l:list  s:sort(%s)  c:color(%s)  q:quit  * duplicate", sort_name(), color_name());
+        mvprintw(1, 0, "Arrows select  Enter open  Backspace up  l:list  f:filter  s:sort(%s)  c:color(%s)  q:quit  * duplicate", sort_name(), color_name());
         BoxList boxes = {0}; layout_children(current, 0, 2, cols, rows - 4, &boxes);
         Node *selected_node = NULL;
         if (list_mode) {
+            if (filter[0] && (!current->child_count || !name_matches(current->children[selected < current->child_count ? selected : 0]->name, filter))) selected = next_match(current, 0, 1, filter);
             if (selected >= current->child_count && current->child_count) selected = current->child_count - 1;
             int list_rows = rows - 5;
             if (list_rows < 1) list_rows = 1;
             size_t first = selected >= (size_t)list_rows ? selected - (size_t)list_rows + 1 : 0;
             mvprintw(2, 0, "Contents (%zu items):", current->child_count);
+            size_t shown = 0;
             for (size_t i = first; i < current->child_count && (int)(i - first) < list_rows; ++i) {
                 Node *item = current->children[i]; char item_size[32]; format_size(item->size, item_size, sizeof(item_size));
+                if (!name_matches(item->name, filter)) continue;
                 int name_width = cols > 28 ? cols - 25 : 1;
-                mvprintw(3 + (int)(i - first), 0, "%c %-*.*s %10s  %s%s", i == selected ? '>' : ' ', name_width, name_width,
+                mvprintw(3 + (int)shown, 0, "%c %-*.*s %10s  %s%s", i == selected ? '>' : ' ', name_width, name_width,
                          item->name, item_size, item->is_dir ? "directory" : "file", item->inaccessible ? " [permission denied]" : "");
+                ++shown;
             }
-            if (current->child_count) selected_node = current->children[selected];
+            if (current->child_count && (!filter[0] || name_matches(current->children[selected]->name, filter))) selected_node = current->children[selected];
+            if (filter[0] && !shown) mvprintw(3, 0, "No items match '%s'", filter);
         } else {
             if (selected >= boxes.count && boxes.count) selected = boxes.count - 1;
             for (size_t i = 0; i < boxes.count; ++i) draw_box(&boxes.items[i], i == selected, 0);
@@ -440,16 +468,19 @@ int main(int argc, char **argv) {
         int key = getch();
         if (key == 'q' || key == 'Q') { free(boxes.items); break; }
         if (key == 'l' || key == 'L') { list_mode = !list_mode; selected = 0; }
+        else if (key == 'f' || key == 'F') {
+            list_mode = 1; echo(); curs_set(1); mvprintw(rows - 1, 0, "Filter (empty clears): "); clrtoeol(); getnstr(filter, sizeof(filter) - 1); noecho(); curs_set(0); selected = 0;
+        }
         else if (key == 's' || key == 'S') { sort_mode = (sort_mode + 1) % 3; if (current->child_count) qsort(current->children, current->child_count, sizeof(*current->children), compare_nodes); selected = 0; }
         else if (key == 'c' || key == 'C') { color_mode = (color_mode + 1) % 3; }
-        else if (list_mode && (key == KEY_LEFT || key == KEY_UP)) { if (selected) --selected; }
-        else if (list_mode && (key == KEY_RIGHT || key == KEY_DOWN)) { if (selected + 1 < current->child_count) ++selected; }
-        else if (list_mode && (key == '\n' || key == KEY_ENTER) && selected_node && selected_node->is_dir && !selected_node->inaccessible) { current = selected_node; selected = 0; }
+        else if (list_mode && (key == KEY_LEFT || key == KEY_UP)) { if (filter[0]) selected = next_match(current, selected, -1, filter); else if (selected) --selected; }
+        else if (list_mode && (key == KEY_RIGHT || key == KEY_DOWN)) { if (filter[0]) selected = next_match(current, selected, 1, filter); else if (selected + 1 < current->child_count) ++selected; }
+        else if (list_mode && (key == '\n' || key == KEY_ENTER) && selected_node && selected_node->is_dir && !selected_node->inaccessible) { current = selected_node; selected = 0; filter[0] = '\0'; }
         else if (!list_mode && (key == KEY_LEFT || key == KEY_UP)) { if (selected) --selected; }
         else if (!list_mode && (key == KEY_RIGHT || key == KEY_DOWN)) { if (selected + 1 < boxes.count) ++selected; }
-        else if (!list_mode && (key == '\n' || key == KEY_ENTER) && selected_node && selected_node->is_dir && !selected_node->inaccessible) { current = selected_node; selected = 0; }
+        else if (!list_mode && (key == '\n' || key == KEY_ENTER) && selected_node && selected_node->is_dir && !selected_node->inaccessible) { current = selected_node; selected = 0; filter[0] = '\0'; }
         else if ((key == KEY_BACKSPACE || key == 127 || key == 8) && current != root) {
-            current = current->parent; selected = 0;
+            current = current->parent; selected = 0; filter[0] = '\0';
         }
         free(boxes.items);
     }
