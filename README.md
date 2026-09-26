@@ -45,9 +45,8 @@ skipped and inaccessible directories are shown as empty entries rather than
 crashing the scan.
 
 The current V1 deliberately focuses on correctness and a dependable core.
-Duplicate detection is available through `--dupes`; richer in-treemap duplicate
-highlighting is shown with red borders in normal mode. Additional display modes
-are planned for the next release.
+Duplicate detection is available through `--dupes`; duplicate files are also
+highlighted with red borders in normal mode.
 
 ## Install the man page
 
