@@ -1,0 +1,43 @@
+.TH DUPMAP 1 "September 2026" "dupmap 0.1.0" "User Commands"
+.SH NAME
+dupmap \- terminal disk usage treemap and duplicate report
+.SH SYNOPSIS
+.B dupmap
+.RI [ options ] [ path ]
+.SH DESCRIPTION
+.B dupmap
+recursively scans a directory and displays its contents as a navigable
+terminal treemap. Small files are grouped in a navigable \fBother\fR folder.
+.SH OPTIONS
+.TP
+.B --dupes [path]
+Report duplicate files and estimated reclaimable space, then exit.
+.TP
+.B -h, --help
+Show usage information.
+.TP
+.B -v, --version
+Show the program version.
+.SH INTERACTIVE KEYS
+.TP
+.B Arrow keys
+Select an item.
+.TP
+.B Enter
+Open the selected directory.
+.TP
+.B Backspace
+Return to the parent directory.
+.TP
+.B l
+Toggle the complete list view.
+.TP
+.B q
+Quit.
+.SH FILESYSTEM BEHAVIOR
+Symbolic links are skipped and are never followed. Directories that cannot be
+read are displayed as inaccessible instead of terminating the scan.
+.SH AUTHOR
+Jawad Ahmad M
+.SH LICENSE
+MIT License.

@@ -1,5 +1,7 @@
 # dupmap
 
+Version 0.1.0
+
 `dupmap` is a small terminal disk-usage visualizer. It scans a directory, shows
 its contents as a treemap, and lets you navigate into folders without leaving
 the terminal.
@@ -42,4 +44,12 @@ skipped and inaccessible directories are shown as empty entries rather than
 crashing the scan.
 
 The current V1 deliberately focuses on correctness and a dependable core.
-Duplicate detection and richer visualization are planned for V2.
+Duplicate detection is available through `--dupes`; richer in-treemap duplicate
+highlighting and additional display modes are planned for the next release.
+
+## Install the man page
+
+```sh
+sudo install -Dm644 dupmap.1 /usr/local/share/man/man1/dupmap.1
+man dupmap
+```

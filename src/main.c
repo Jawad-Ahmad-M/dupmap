@@ -12,6 +12,8 @@
 #include <stdint.h>
 #include <unistd.h>
 
+#define DUPMAP_VERSION "0.1.0"
+
 typedef struct Node Node;
 struct Node {
     char *name;
@@ -322,6 +324,20 @@ static void format_size(off_t value, char *out, size_t length) {
 }
 
 int main(int argc, char **argv) {
+    if (argc > 1 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
+        printf("Usage: dupmap [options] [path]\n\n"
+               "Options:\n"
+               "  --dupes [path]  report duplicate files and reclaimable space\n"
+               "  -h, --help      show this help\n"
+               "  -v, --version   show version\n\n"
+               "Interactive keys: arrows select, Enter opens, Backspace goes up,\n"
+               "l toggles the complete list view, q quits.\n");
+        return EXIT_SUCCESS;
+    }
+    if (argc > 1 && (!strcmp(argv[1], "--version") || !strcmp(argv[1], "-v"))) {
+        puts("dupmap " DUPMAP_VERSION);
+        return EXIT_SUCCESS;
+    }
     int dupes_mode = argc > 1 && !strcmp(argv[1], "--dupes");
     char cwd[PATH_MAX]; const char *root_path = dupes_mode ? (argc > 2 ? argv[2] : ".") : (argc > 1 ? argv[1] : (getcwd(cwd, sizeof(cwd)) ? cwd : "."));
     char resolved[PATH_MAX]; if (realpath(root_path, resolved)) root_path = resolved;
