@@ -69,3 +69,7 @@ cmake -S . -B build-cmake
 cmake --build build-cmake
 sudo cmake --install build-cmake
 ```
+
+When launched without an explicit path, dupmap remembers the last directory,
+sort mode, color mode, and view mode in `${XDG_STATE_HOME:-~/.config}/dupmap/state`.
+The state file is optional and failures to write it do not affect scanning.

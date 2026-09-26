@@ -26,12 +26,13 @@ struct Node {
     int inaccessible;
     int is_duplicate;
     time_t modified;
+    size_t file_count;
     Node **children;
     size_t child_count;
     size_t child_cap;
 };
 
-typedef struct { int x, y, w, h; Node *node; } Box;
+typedef struct { int x, y, w, h; Node *node; double percent; } Box;
 typedef struct { Box *items; size_t count, cap; } BoxList;
 typedef struct { Node **files; size_t count; off_t size; } DuplicateGroup;
 static int sort_mode = 0; /* 0 size, 1 name, 2 modified */
@@ -61,6 +62,7 @@ static Node *new_node(const char *name, const char *path, int is_dir) {
     node->name = copy_string(name);
     node->path = copy_string(path);
     node->is_dir = is_dir;
+    node->file_count = is_dir ? 0 : 1;
     return node;
 }
 
@@ -75,6 +77,7 @@ static void add_child(Node *parent, Node *child) {
     parent->children[parent->child_count++] = child;
     child->parent = parent;
     parent->size += child->size;
+    parent->file_count += child->file_count;
 }
 
 static int compare_nodes(const void *a, const void *b) {
@@ -207,7 +210,7 @@ static Node *scan_path(const char *path, const char *display_name, int is_root) 
         } else kept[kept_count++] = child;
     }
     free(dir->children);
-    dir->children = NULL; dir->child_count = 0; dir->child_cap = 0; dir->size = 0;
+    dir->children = NULL; dir->child_count = 0; dir->child_cap = 0; dir->size = 0; dir->file_count = 0;
     for (size_t i = 0; i < kept_count; ++i) add_child(dir, kept[i]);
     free(kept);
     if (tiny_count > 0) {
@@ -229,7 +232,7 @@ static void free_node(Node *node) {
     free(node->children); free(node->name); free(node->path); free(node);
 }
 
-static void add_box(BoxList *list, int x, int y, int w, int h, Node *node) {
+static void add_box(BoxList *list, int x, int y, int w, int h, Node *node, off_t parent_size) {
     if (w < 1 || h < 1) return;
     if (list->count == list->cap) {
         size_t next = list->cap ? list->cap * 2 : 64;
@@ -237,7 +240,8 @@ static void add_box(BoxList *list, int x, int y, int w, int h, Node *node) {
         if (!grown) die("out of memory");
         list->items = grown; list->cap = next;
     }
-    list->items[list->count++] = (Box){x, y, w, h, node};
+    double percent = parent_size > 0 ? ((double)node->size * 100.0 / (double)parent_size) : 0.0;
+    list->items[list->count++] = (Box){x, y, w, h, node, percent};
 }
 
 static double aspect(double area, double short_side) {
@@ -287,8 +291,8 @@ static void layout_children(Node *parent, int x, int y, int w, int h, BoxList *b
             int length = (i == best_end) ? (horizontal ? left + width - cursor : top + height - cursor)
                                          : (int)((actual_row * ((double)child->size / (double)(remaining_size))) / row_size + 0.5);
             if (length < 1) length = 1;
-            if (horizontal) { add_box(boxes, cursor, top, length, row_size, child); cursor += length; }
-            else { add_box(boxes, left, cursor, row_size, length, child); cursor += length; }
+            if (horizontal) { add_box(boxes, cursor, top, length, row_size, child, parent->size); cursor += length; }
+            else { add_box(boxes, left, cursor, row_size, length, child, parent->size); cursor += length; }
         }
         if (horizontal) { top += row_size; height -= row_size; }
         else { left += row_size; width -= row_size; }
@@ -349,7 +353,8 @@ static void draw_box(const Box *box, int selected, int depth) {
         int start_x = box->x + (has_border ? 1 : 0);
         int label_row = box->y + (has_border ? 1 : 0);
         int max = box->w - (has_border ? 2 : 1); char label[256];
-        snprintf(label, sizeof(label), "%s", box->node->name);
+        if (box->node->is_dir) snprintf(label, sizeof(label), "%s [%zu] %.1f%%", box->node->name, box->node->file_count, box->percent);
+        else snprintf(label, sizeof(label), "%s %.1f%%", box->node->name, box->percent);
         if ((int)strlen(label) > max) { if (max > 3) { label[max - 3] = '.'; label[max - 2] = '.'; label[max - 1] = '.'; label[max] = '\0'; } else label[max] = '\0'; }
         mvaddnstr(label_row, start_x, label, max);
     }
@@ -368,6 +373,42 @@ static const char *sort_name(void) {
 
 static const char *color_name(void) {
     return color_mode == 1 ? "type" : (color_mode == 2 ? "heat" : "depth");
+}
+
+static int load_state(char *last_path, size_t path_length, int *saved_sort, int *saved_color, int *saved_list) {
+    const char *base = getenv("XDG_STATE_HOME");
+    char state_path[PATH_MAX];
+    if (base && *base) snprintf(state_path, sizeof(state_path), "%s/dupmap/state", base);
+    else {
+        const char *home = getenv("HOME");
+        if (!home || !*home) return 0;
+        snprintf(state_path, sizeof(state_path), "%s/.config/dupmap/state", home);
+    }
+    FILE *file = fopen(state_path, "r");
+    if (!file) return 0;
+    if (!fgets(last_path, (int)path_length, file)) { fclose(file); return 0; }
+    last_path[strcspn(last_path, "\r\n")] = '\0';
+    (void)fscanf(file, "%d %d %d", saved_sort, saved_color, saved_list);
+    fclose(file);
+    struct stat st;
+    return *last_path && stat(last_path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static void save_state(const char *last_path, int saved_sort, int saved_color, int saved_list) {
+    const char *base = getenv("XDG_STATE_HOME");
+    char state_dir[PATH_MAX], state_path[PATH_MAX];
+    if (base && *base) snprintf(state_dir, sizeof(state_dir), "%s/dupmap", base);
+    else {
+        const char *home = getenv("HOME");
+        if (!home || !*home) return;
+        snprintf(state_dir, sizeof(state_dir), "%s/.config/dupmap", home);
+    }
+    if (mkdir(state_dir, 0700) != 0 && errno != EEXIST) return;
+    snprintf(state_path, sizeof(state_path), "%s/state", state_dir);
+    FILE *file = fopen(state_path, "w");
+    if (!file) return;
+    fprintf(file, "%s\n%d %d %d\n", last_path, saved_sort, saved_color, saved_list);
+    fclose(file);
 }
 
 static int name_matches(const char *name, const char *query) {
@@ -408,7 +449,12 @@ int main(int argc, char **argv) {
         return EXIT_SUCCESS;
     }
     int dupes_mode = argc > 1 && !strcmp(argv[1], "--dupes");
-    char cwd[PATH_MAX]; const char *root_path = dupes_mode ? (argc > 2 ? argv[2] : ".") : (argc > 1 ? argv[1] : (getcwd(cwd, sizeof(cwd)) ? cwd : "."));
+    char cwd[PATH_MAX], saved_path[PATH_MAX]; int saved_list_mode = 0;
+    const char *root_path;
+    if (dupes_mode) root_path = argc > 2 ? argv[2] : ".";
+    else if (argc > 1) root_path = argv[1];
+    else if (load_state(saved_path, sizeof(saved_path), &sort_mode, &color_mode, &saved_list_mode)) root_path = saved_path;
+    else root_path = getcwd(cwd, sizeof(cwd)) ? cwd : ".";
     char resolved[PATH_MAX]; if (realpath(root_path, resolved)) root_path = resolved;
     Node *root = scan_path(root_path, root_path, 1);
     if (!root) { fprintf(stderr, "dupmap: cannot read '%s': %s\n", root_path, strerror(errno)); return EXIT_FAILURE; }
@@ -428,7 +474,7 @@ int main(int argc, char **argv) {
     initscr(); cbreak(); noecho(); keypad(stdscr, TRUE); curs_set(0); start_color(); use_default_colors();
     for (int i = 1; i <= 6; ++i) init_pair(i, i, -1);
     init_pair(7, COLOR_RED, -1);
-    Node *current = root; size_t selected = 0; int list_mode = 0; char filter[256] = "";
+    Node *current = root; size_t selected = 0; int list_mode = saved_list_mode; char filter[256] = "";
     for (;;) {
         int rows, cols; getmaxyx(stdscr, rows, cols); erase();
         char size_text[32]; format_size(current->size, size_text, sizeof(size_text));
@@ -461,9 +507,11 @@ int main(int argc, char **argv) {
         }
         if (selected_node) {
             char selected_size[32]; format_size(selected_node->size, selected_size, sizeof(selected_size));
-            mvprintw(rows - 2, 0, "%s  (%s)%s", selected_node->path, selected_size,
-                     selected_node->inaccessible ? " [permission denied]" : "");
+            mvprintw(rows - 2, 0, "%s  (%s)%s%s", selected_node->path, selected_size,
+                     selected_node->inaccessible ? " [permission denied]" : "",
+                     selected_node->is_duplicate ? " [duplicate]" : "");
         } else mvprintw(rows - 2, 0, "%s  (empty or inaccessible)", current->path);
+        mvprintw(rows - 1, 0, "Legend: mode=%s | red=duplicate | folders show file count and percentage", color_name());
         refresh();
         int key = getch();
         if (key == 'q' || key == 'Q') { free(boxes.items); break; }
@@ -484,5 +532,5 @@ int main(int argc, char **argv) {
         }
         free(boxes.items);
     }
-    endwin(); free_duplicate_groups(duplicate_groups, duplicate_group_count); free_node(root); return EXIT_SUCCESS;
+    endwin(); save_state(root->path, sort_mode, color_mode, list_mode); free_duplicate_groups(duplicate_groups, duplicate_group_count); free_node(root); return EXIT_SUCCESS;
 }

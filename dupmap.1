@@ -46,6 +46,9 @@ Quit.
 .SH FILESYSTEM BEHAVIOR
 Symbolic links are skipped and are never followed. Directories that cannot be
 read are displayed as inaccessible instead of terminating the scan.
+.SH STATE
+When no path is supplied, the last directory and display modes are loaded from
+the dupmap state file under XDG_STATE_HOME, or ~/.config/dupmap/state.
 .SH AUTHOR
 Jawad Ahmad M
 .SH LICENSE

@@ -49,12 +49,14 @@ static void test_scan_aggregates_and_groups(void) {
     assert(root);
     assert(root->is_dir);
     assert(root->size == 11003);
+    assert(root->file_count == 3);
     assert(child_named(root, "large.bin"));
     assert(child_named(root, "nested"));
     assert(child_named(root, "empty"));
     assert(child_named(root, "link-to-large") == NULL);
     Node *other = child_named(root, "other");
     assert(other && other->is_dir && other->size == 3);
+    assert(other->file_count == 1);
     assert(child_named(other, "tiny.txt"));
     assert(child_named(other, "tiny.txt")->parent == other);
     Node *nested = child_named(root, "nested");
@@ -92,6 +94,7 @@ static void test_layout_stays_inside_view(void) {
         assert(a.x >= x && a.y >= y);
         assert(a.x + a.w <= x + width && a.y + a.h <= y + height);
         assert(a.w > 0 && a.h > 0);
+        assert(a.percent >= 0.0 && a.percent <= 100.0);
         for (size_t j = i + 1; j < boxes.count; ++j) {
             Box b = boxes.items[j];
             int overlap = a.x < b.x + b.w && a.x + a.w > b.x &&
