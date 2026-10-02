@@ -328,33 +328,40 @@ static int node_color(const Node *node, int depth) {
 
 static void draw_box(const Box *box, int selected, int depth, int pulse) {
     int color = node_color(box->node, depth);
+    int x = box->x, y = box->y, w = box->w, h = box->h;
+    /* Leave a cell gutter around roomy tiles; preserve every cell in tight layouts. */
+    if (w >= 6 && h >= 4) { ++x; ++y; w -= 2; h -= 2; }
     attron(COLOR_PAIR(color));
-    for (int row = box->y; row < box->y + box->h; ++row) {
-        for (int col = box->x; col < box->x + box->w; ++col) mvaddch(row, col, ' ');
+    for (int row = y; row < y + h; ++row) {
+        for (int col = x; col < x + w; ++col) mvaddch(row, col, ' ');
     }
 
-    int has_border = box->w >= 2 && box->h >= 2;
-    if (selected) attron(A_BOLD | (pulse ? A_REVERSE : 0));
+    int has_border = w >= 2 && h >= 2;
+    if (selected) attron(A_REVERSE | A_BOLD | (pulse ? A_UNDERLINE : 0));
+    else if (box->node->is_dir) attron(A_BOLD);
     if (has_border) {
-        mvaddch(box->y, box->x, ACS_ULCORNER);
-        mvaddch(box->y, box->x + box->w - 1, ACS_URCORNER);
-        mvaddch(box->y + box->h - 1, box->x, ACS_LLCORNER);
-        mvaddch(box->y + box->h - 1, box->x + box->w - 1, ACS_LRCORNER);
-        for (int col = box->x + 1; col < box->x + box->w - 1; ++col) {
-            mvaddch(box->y, col, ACS_HLINE);
-            mvaddch(box->y + box->h - 1, col, ACS_HLINE);
+        mvaddch(y, x, ACS_ULCORNER);
+        mvaddch(y, x + w - 1, ACS_URCORNER);
+        mvaddch(y + h - 1, x, ACS_LLCORNER);
+        mvaddch(y + h - 1, x + w - 1, ACS_LRCORNER);
+        for (int col = x + 1; col < x + w - 1; ++col) {
+            mvaddch(y, col, ACS_HLINE);
+            mvaddch(y + h - 1, col, ACS_HLINE);
         }
-        for (int row = box->y + 1; row < box->y + box->h - 1; ++row) {
-            mvaddch(row, box->x, ACS_VLINE);
-            mvaddch(row, box->x + box->w - 1, ACS_VLINE);
+        for (int row = y + 1; row < y + h - 1; ++row) {
+            mvaddch(row, x, ACS_VLINE);
+            mvaddch(row, x + w - 1, ACS_VLINE);
         }
     }
-    if (box->w >= (has_border ? 4 : 3) && box->h >= (has_border ? 3 : 1)) {
-        int start_x = box->x + (has_border ? 1 : 0);
-        int label_row = box->y + (has_border ? 1 : 0);
-        int max = box->w - (has_border ? 2 : 1); char label[256];
-        if (box->node->is_dir) snprintf(label, sizeof(label), "%s [%zu] %.1f%%", box->node->name, box->node->file_count, box->percent);
-        else snprintf(label, sizeof(label), "%s %.1f%%", box->node->name, box->percent);
+    if (w >= (has_border ? 4 : 3) && h >= (has_border ? 3 : 1)) {
+        int start_x = x + (has_border ? 1 : 0);
+        int label_row = y + (has_border ? 1 : 0);
+        int max = w - (has_border ? 2 : 1); char label[256];
+        if (box->node->is_dir && w >= 18 && h >= 4)
+            snprintf(label, sizeof(label), "%s [%zu] %.1f%%", box->node->name, box->node->file_count, box->percent);
+        else if (box->node->is_dir) snprintf(label, sizeof(label), "%s/ [%zu]", box->node->name, box->node->file_count);
+        else if (w >= 18 && h >= 4) snprintf(label, sizeof(label), "%s  %.1f%%", box->node->name, box->percent);
+        else snprintf(label, sizeof(label), "%s", box->node->name);
         if ((int)strlen(label) > max) { if (max > 3) { label[max - 3] = '.'; label[max - 2] = '.'; label[max - 1] = '.'; label[max] = '\0'; } else label[max] = '\0'; }
         mvaddnstr(label_row, start_x, label, max);
     }
@@ -476,8 +483,8 @@ int main(int argc, char **argv) {
     DuplicateGroup *duplicate_groups = NULL;
     size_t duplicate_group_count = find_duplicate_groups(root, &duplicate_groups);
     initscr(); cbreak(); noecho(); keypad(stdscr, TRUE); curs_set(0); start_color(); use_default_colors();
-    for (int i = 1; i <= 6; ++i) init_pair(i, i, -1);
-    init_pair(7, COLOR_RED, -1);
+    for (int i = 1; i <= 6; ++i) init_pair(i, COLOR_WHITE, i);
+    init_pair(7, COLOR_WHITE, COLOR_RED);
     Node *current = root; size_t selected = 0; int list_mode = saved_list_mode; char filter[256] = "";
     int pulse_frames = 0;
     for (;;) {
@@ -491,9 +498,15 @@ int main(int argc, char **argv) {
             continue;
         }
         char size_text[32]; format_size(current->size, size_text, sizeof(size_text));
-        char header[PATH_MAX + 64];
-        snprintf(header, sizeof(header), "dupmap  %s  | %s", current->path, size_text);
-        mvaddnstr(0, 0, header, cols);
+        const char *directory_name = strrchr(current->path, '/');
+        directory_name = directory_name ? directory_name + 1 : current->path;
+        if (!*directory_name) directory_name = current->path;
+        char header[PATH_MAX + 32];
+        snprintf(header, sizeof(header), "dupmap  %s", directory_name);
+        attron(A_BOLD);
+        mvaddnstr(0, 0, header, cols > 18 ? cols - 18 : cols);
+        attroff(A_BOLD);
+        if (cols >= 24) mvprintw(0, cols - (int)strlen(size_text) - 2, "%s", size_text);
         const char *help = cols >= 65 ? "Arrows select  Enter open  Backspace up  l:list  f:filter  s:sort  c:color  q:quit" :
                            (cols >= 32 ? "Arrows move  Enter open  Backspace up  q quit" : "Arrows move  Enter open  q quit");
         mvaddnstr(1, 0, help, cols);
@@ -520,9 +533,13 @@ int main(int argc, char **argv) {
                 int line = list_start + (int)shown;
                 if (line >= rows - footer_rows) break;
                 char entry[PATH_MAX + 64];
-                snprintf(entry, sizeof(entry), "%c %s  %s  %s%s", i == selected ? '>' : ' ', item->name, item_size,
-                         item->is_dir ? "directory" : "file", item->inaccessible ? " [permission denied]" : "");
+                snprintf(entry, sizeof(entry), "%c %s%s  %s%s", i == selected ? '>' : ' ', item->is_dir ? "[D] " : "[F] ", item->name,
+                         item_size, item->inaccessible ? "  [permission denied]" : "");
+                if (item->is_duplicate) attron(COLOR_PAIR(7));
+                if (i == selected) attron(A_REVERSE | A_BOLD);
+                else if (item->is_dir) attron(A_BOLD);
                 mvaddnstr(line, 0, entry, cols);
+                attroff(A_REVERSE | A_BOLD | COLOR_PAIR(7));
                 ++shown;
             }
             if (current->child_count && (!filter[0] || name_matches(current->children[selected]->name, filter))) selected_node = current->children[selected];
@@ -535,14 +552,14 @@ int main(int argc, char **argv) {
         int status_y = rows - footer_rows;
         if (selected_node) {
             char selected_size[32], status[PATH_MAX + 96]; format_size(selected_node->size, selected_size, sizeof(selected_size));
-            snprintf(status, sizeof(status), "%s  (%s)%s%s", selected_node->path, selected_size,
-                     selected_node->inaccessible ? " [permission denied]" : "",
-                     selected_node->is_duplicate ? " [duplicate]" : "");
+            snprintf(status, sizeof(status), "%s  |  %s%s%s", selected_node->name, selected_size,
+                     selected_node->inaccessible ? "  [permission denied]" : "",
+                     selected_node->is_duplicate ? "  [duplicate]" : "");
             mvaddnstr(status_y, 0, status, cols);
         } else mvaddnstr(status_y, 0, "Directory is empty or inaccessible", cols);
         if (footer_rows == 2) {
             char footer[128];
-            snprintf(footer, sizeof(footer), "Sort: %s | Color: %s | red=duplicate | folders show file count and percentage", sort_name(), color_name());
+            snprintf(footer, sizeof(footer), "Sort: %s | Color: %s | [D] folder  [F] file  red=duplicate", sort_name(), color_name());
             mvaddnstr(rows - 1, 0, footer, cols);
         }
         refresh();

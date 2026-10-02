@@ -9,6 +9,7 @@ contents, or switch to a full list when the treemap is too crowded.
 
 - Squarified treemap with size, name, or modification-time sorting.
 - Depth, file-type, and size-heat color modes.
+- Color-filled treemap tiles, separated gutters, bold folder labels, and a strong selected-item highlight.
 - List view with case-insensitive name filtering.
 - Exact duplicate file detection, with duplicate entries highlighted in red.
 - Remembers the last directory and view preferences when no path is supplied.
