@@ -9,7 +9,7 @@ contents, or switch to a full list when the treemap is too crowded.
 
 - Squarified treemap with size, name, or modification-time sorting.
 - Depth, file-type, and size-heat color modes.
-- Color-filled treemap tiles, separated gutters, bold folder labels, and a strong selected-item highlight.
+- Solid color-filled treemap tiles with no internal borders, separated gutters, bold folder labels, and a distinct selected fill.
 - List view with case-insensitive name filtering.
 - Exact duplicate file detection, with duplicate entries highlighted in red.
 - Remembers the last directory and view preferences when no path is supplied.
@@ -61,7 +61,8 @@ and estimated reclaimable space, then exits without starting the TUI.
 Selection briefly pulses as visual feedback when moving through the treemap.
 Tiny files are grouped under an `other` folder so they remain accessible while
 keeping the treemap readable. The selected item's full path and size appear
-below the view; duplicate files have red borders.
+below the view; duplicate files have a red fill, and the selected tile uses a
+contrasting fill.
 
 ## Data and limitations
 

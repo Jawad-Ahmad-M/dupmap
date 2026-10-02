@@ -331,32 +331,17 @@ static void draw_box(const Box *box, int selected, int depth, int pulse) {
     int x = box->x, y = box->y, w = box->w, h = box->h;
     /* Leave a cell gutter around roomy tiles; preserve every cell in tight layouts. */
     if (w >= 6 && h >= 4) { ++x; ++y; w -= 2; h -= 2; }
-    attron(COLOR_PAIR(color));
+    attron(COLOR_PAIR(selected ? 8 : color));
     for (int row = y; row < y + h; ++row) {
         for (int col = x; col < x + w; ++col) mvaddch(row, col, ' ');
     }
 
-    int has_border = w >= 2 && h >= 2;
-    if (selected) attron(A_REVERSE | A_BOLD | (pulse ? A_UNDERLINE : 0));
+    if (selected) attron(A_BOLD | (pulse ? A_UNDERLINE : 0));
     else if (box->node->is_dir) attron(A_BOLD);
-    if (has_border) {
-        mvaddch(y, x, ACS_ULCORNER);
-        mvaddch(y, x + w - 1, ACS_URCORNER);
-        mvaddch(y + h - 1, x, ACS_LLCORNER);
-        mvaddch(y + h - 1, x + w - 1, ACS_LRCORNER);
-        for (int col = x + 1; col < x + w - 1; ++col) {
-            mvaddch(y, col, ACS_HLINE);
-            mvaddch(y + h - 1, col, ACS_HLINE);
-        }
-        for (int row = y + 1; row < y + h - 1; ++row) {
-            mvaddch(row, x, ACS_VLINE);
-            mvaddch(row, x + w - 1, ACS_VLINE);
-        }
-    }
-    if (w >= (has_border ? 4 : 3) && h >= (has_border ? 3 : 1)) {
-        int start_x = x + (has_border ? 1 : 0);
-        int label_row = y + (has_border ? 1 : 0);
-        int max = w - (has_border ? 2 : 1); char label[256];
+    if (w >= 3 && h >= 1) {
+        int start_x = x;
+        int label_row = y;
+        int max = w; char label[256];
         if (box->node->is_dir && w >= 18 && h >= 4)
             snprintf(label, sizeof(label), "%s [%zu] %.1f%%", box->node->name, box->node->file_count, box->percent);
         else if (box->node->is_dir) snprintf(label, sizeof(label), "%s/ [%zu]", box->node->name, box->node->file_count);
@@ -485,6 +470,7 @@ int main(int argc, char **argv) {
     initscr(); cbreak(); noecho(); keypad(stdscr, TRUE); curs_set(0); start_color(); use_default_colors();
     for (int i = 1; i <= 6; ++i) init_pair(i, COLOR_WHITE, i);
     init_pair(7, COLOR_WHITE, COLOR_RED);
+    init_pair(8, COLOR_BLACK, COLOR_WHITE);
     Node *current = root; size_t selected = 0; int list_mode = saved_list_mode; char filter[256] = "";
     int pulse_frames = 0;
     for (;;) {
