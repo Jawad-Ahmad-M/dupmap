@@ -482,41 +482,69 @@ int main(int argc, char **argv) {
     int pulse_frames = 0;
     for (;;) {
         int rows, cols; getmaxyx(stdscr, rows, cols); erase();
+        if (rows < 6 || cols < 16) {
+            mvaddnstr(0, 0, "Terminal too small; resize to continue (q quits)", cols > 0 ? cols : 0);
+            refresh();
+            timeout(-1);
+            int key = getch();
+            if (key == 'q' || key == 'Q') break;
+            continue;
+        }
         char size_text[32]; format_size(current->size, size_text, sizeof(size_text));
-        mvprintw(0, 0, "dupmap  %s  | %s", current->path, size_text);
-        mvprintw(1, 0, "Arrows select  Enter open  Backspace up  l:list  f:filter  s:sort(%s)  c:color(%s)  q:quit  * duplicate", sort_name(), color_name());
-        BoxList boxes = {0}; layout_children(current, 0, 2, cols, rows - 4, &boxes);
+        char header[PATH_MAX + 64];
+        snprintf(header, sizeof(header), "dupmap  %s  | %s", current->path, size_text);
+        mvaddnstr(0, 0, header, cols);
+        const char *help = cols >= 65 ? "Arrows select  Enter open  Backspace up  l:list  f:filter  s:sort  c:color  q:quit" :
+                           (cols >= 32 ? "Arrows move  Enter open  Backspace up  q quit" : "Arrows move  Enter open  q quit");
+        mvaddnstr(1, 0, help, cols);
+        BoxList boxes = {0};
+        int view_y = 2;
+        int footer_rows = rows >= 10 ? 2 : 1;
+        layout_children(current, 0, view_y, cols, rows - view_y - footer_rows, &boxes);
+        int auto_list = cols < 48 || rows < 12 || boxes.count < current->child_count ||
+                        boxes.count > (size_t)(cols * (rows - view_y - footer_rows) / 3);
+        int show_list = list_mode || auto_list;
         Node *selected_node = NULL;
-        if (list_mode) {
+        if (show_list) {
             if (filter[0] && (!current->child_count || !name_matches(current->children[selected < current->child_count ? selected : 0]->name, filter))) selected = next_match(current, 0, 1, filter);
             if (selected >= current->child_count && current->child_count) selected = current->child_count - 1;
-            int list_rows = rows - 5;
+            int list_start = rows >= 10 ? 3 : view_y;
+            int list_rows = rows - footer_rows - list_start;
             if (list_rows < 1) list_rows = 1;
             size_t first = selected >= (size_t)list_rows ? selected - (size_t)list_rows + 1 : 0;
-            mvprintw(2, 0, "Contents (%zu items):", current->child_count);
+            if (rows >= 10) mvprintw(2, 0, "Contents (%zu items)%s:", current->child_count, auto_list && !list_mode ? " (list view: crowded or compact terminal)" : "");
             size_t shown = 0;
             for (size_t i = first; i < current->child_count && (int)(i - first) < list_rows; ++i) {
                 Node *item = current->children[i]; char item_size[32]; format_size(item->size, item_size, sizeof(item_size));
                 if (!name_matches(item->name, filter)) continue;
-                int name_width = cols > 28 ? cols - 25 : 1;
-                mvprintw(3 + (int)shown, 0, "%c %-*.*s %10s  %s%s", i == selected ? '>' : ' ', name_width, name_width,
-                         item->name, item_size, item->is_dir ? "directory" : "file", item->inaccessible ? " [permission denied]" : "");
+                int line = list_start + (int)shown;
+                if (line >= rows - footer_rows) break;
+                char entry[PATH_MAX + 64];
+                snprintf(entry, sizeof(entry), "%c %s  %s  %s%s", i == selected ? '>' : ' ', item->name, item_size,
+                         item->is_dir ? "directory" : "file", item->inaccessible ? " [permission denied]" : "");
+                mvaddnstr(line, 0, entry, cols);
                 ++shown;
             }
             if (current->child_count && (!filter[0] || name_matches(current->children[selected]->name, filter))) selected_node = current->children[selected];
-            if (filter[0] && !shown) mvprintw(3, 0, "No items match '%s'", filter);
+            if (filter[0] && !shown && rows - footer_rows > list_start) mvaddnstr(list_start, 0, "No items match the filter", cols);
         } else {
             if (selected >= boxes.count && boxes.count) selected = boxes.count - 1;
             for (size_t i = 0; i < boxes.count; ++i) draw_box(&boxes.items[i], i == selected, 0, pulse_frames > 1);
             if (boxes.count) selected_node = boxes.items[selected].node;
         }
+        int status_y = rows - footer_rows;
         if (selected_node) {
-            char selected_size[32]; format_size(selected_node->size, selected_size, sizeof(selected_size));
-            mvprintw(rows - 2, 0, "%s  (%s)%s%s", selected_node->path, selected_size,
+            char selected_size[32], status[PATH_MAX + 96]; format_size(selected_node->size, selected_size, sizeof(selected_size));
+            snprintf(status, sizeof(status), "%s  (%s)%s%s", selected_node->path, selected_size,
                      selected_node->inaccessible ? " [permission denied]" : "",
                      selected_node->is_duplicate ? " [duplicate]" : "");
-        } else mvprintw(rows - 2, 0, "%s  (empty or inaccessible)", current->path);
-        mvprintw(rows - 1, 0, "Legend: mode=%s | red=duplicate | folders show file count and percentage", color_name());
+            mvaddnstr(status_y, 0, status, cols);
+        } else mvaddnstr(status_y, 0, "Directory is empty or inaccessible", cols);
+        if (footer_rows == 2) {
+            char footer[128];
+            snprintf(footer, sizeof(footer), "Sort: %s | Color: %s | red=duplicate | folders show file count and percentage", sort_name(), color_name());
+            mvaddnstr(rows - 1, 0, footer, cols);
+        }
         refresh();
         timeout(pulse_frames ? 70 : -1);
         int key = getch();
@@ -529,12 +557,12 @@ int main(int argc, char **argv) {
         }
         else if (key == 's' || key == 'S') { sort_mode = (sort_mode + 1) % 3; if (current->child_count) qsort(current->children, current->child_count, sizeof(*current->children), compare_nodes); selected = 0; }
         else if (key == 'c' || key == 'C') { color_mode = (color_mode + 1) % 3; }
-        else if (list_mode && (key == KEY_LEFT || key == KEY_UP)) { if (filter[0]) selected = next_match(current, selected, -1, filter); else if (selected) --selected; }
-        else if (list_mode && (key == KEY_RIGHT || key == KEY_DOWN)) { if (filter[0]) selected = next_match(current, selected, 1, filter); else if (selected + 1 < current->child_count) ++selected; }
-        else if (list_mode && (key == '\n' || key == KEY_ENTER) && selected_node && selected_node->is_dir && !selected_node->inaccessible) { current = selected_node; selected = 0; filter[0] = '\0'; }
-        else if (!list_mode && (key == KEY_LEFT || key == KEY_UP)) { if (selected) --selected; }
-        else if (!list_mode && (key == KEY_RIGHT || key == KEY_DOWN)) { if (selected + 1 < boxes.count) ++selected; }
-        else if (!list_mode && (key == '\n' || key == KEY_ENTER) && selected_node && selected_node->is_dir && !selected_node->inaccessible) { current = selected_node; selected = 0; filter[0] = '\0'; }
+        else if (show_list && (key == KEY_LEFT || key == KEY_UP)) { if (filter[0]) selected = next_match(current, selected, -1, filter); else if (selected) --selected; }
+        else if (show_list && (key == KEY_RIGHT || key == KEY_DOWN)) { if (filter[0]) selected = next_match(current, selected, 1, filter); else if (selected + 1 < current->child_count) ++selected; }
+        else if (show_list && (key == '\n' || key == KEY_ENTER) && selected_node && selected_node->is_dir && !selected_node->inaccessible) { current = selected_node; selected = 0; filter[0] = '\0'; }
+        else if (!show_list && (key == KEY_LEFT || key == KEY_UP)) { if (selected) --selected; }
+        else if (!show_list && (key == KEY_RIGHT || key == KEY_DOWN)) { if (selected + 1 < boxes.count) ++selected; }
+        else if (!show_list && (key == '\n' || key == KEY_ENTER) && selected_node && selected_node->is_dir && !selected_node->inaccessible) { current = selected_node; selected = 0; filter[0] = '\0'; }
         else if ((key == KEY_BACKSPACE || key == 127 || key == 8) && current != root) {
             current = current->parent; selected = 0; filter[0] = '\0';
         }
