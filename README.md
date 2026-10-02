@@ -1,86 +1,86 @@
 # dupmap
 
-Version 0.1.0
+`dupmap` is a keyboard-driven terminal disk usage viewer written in C. It scans
+a directory and displays its contents as a treemap: each box represents a file
+or folder, and larger items occupy more space. Enter a folder to explore its
+contents, or switch to a full list when the treemap is too crowded.
 
-`dupmap` is a small terminal disk-usage visualizer. It scans a directory, shows
-its contents as a treemap, and lets you navigate into folders without leaving
-the terminal.
+## Features
 
-The treemap uses bordered, color-coded boxes with a clear selected-box state.
-Use the list view whenever a directory contains more items than can fit
-readably in the available terminal space.
+- Squarified treemap with size, name, or modification-time sorting.
+- Depth, file-type, and size-heat color modes.
+- List view with case-insensitive name filtering.
+- Exact duplicate file detection, with duplicate entries highlighted in red.
+- Remembers the last directory and view preferences when no path is supplied.
+- Skips symbolic links and marks folders that cannot be read.
 
-## Build
+## Requirements and build
 
-On Debian/Ubuntu/WSL:
+Requires a C11 compiler, `make`, and ncurses development headers and library.
+On Debian, Ubuntu, or WSL:
 
 ```sh
 sudo apt install build-essential libncurses-dev
 make
 ```
 
-Run the automated core tests with:
+The executable is created as `./dupmap`. CMake is also supported:
 
 ```sh
-make test
+cmake -S . -B build-cmake
+cmake --build build-cmake
 ```
 
-## Run
+Run the core and duplicate detection checks with `make test`.
+
+## Use
 
 ```sh
 ./dupmap [path]
-```
-
-To list duplicate files and estimated reclaimable space:
-
-```sh
 ./dupmap --dupes [path]
 ```
 
-Keys: arrows select an item, `Enter` opens a directory, `Backspace` goes up,
-`l` toggles a complete list view, `f` filters names in the list view, `s` cycles size/name/modified sorting, `c`
-cycles depth/file-type/size-heat colors, and `q` exits. Very small files are combined into an `other` folder to keep the
-treemap readable; press Enter on it to inspect those files. Symlinks are
-skipped and inaccessible directories are shown as empty entries rather than
-crashing the scan.
+With no path, dupmap opens the last saved directory when it is available;
+otherwise it scans the current directory. `--dupes` prints duplicate groups
+and estimated reclaimable space, then exits without starting the TUI.
 
-The current V1 deliberately focuses on correctness and a dependable core.
-Duplicate detection is available through `--dupes`; duplicate files are also
-highlighted with red borders in normal mode.
+### Interactive keys
 
-## Install the man page
+| Key | Action |
+| --- | --- |
+| Arrow keys | Select an item |
+| Enter | Open the selected folder |
+| Backspace | Go to the parent folder |
+| `l` | Toggle treemap/list view |
+| `f` | Enter a name filter in list view (empty clears it) |
+| `s` | Cycle size, name, and modified-time sorting |
+| `c` | Cycle depth, file-type, and size-heat colors |
+| `q` | Quit |
 
-```sh
-sudo install -Dm644 dupmap.1 /usr/local/share/man/man1/dupmap.1
-man dupmap
-```
+Selection briefly pulses as visual feedback when moving through the treemap.
+Tiny files are grouped under an `other` folder so they remain accessible while
+keeping the treemap readable. The selected item's full path and size appear
+below the view; duplicate files have red borders.
 
-To install the program and man page together:
+## Data and limitations
+
+Scanning is recursive and follows the directory tree while skipping symlinks.
+Directory sizes are the sum of visible descendant file sizes, not allocated
+disk blocks. Duplicate detection compares file sizes and content hashes, then
+confirms matching contents byte-for-byte. It can take time on large trees.
+Files smaller than 4 KiB are grouped into `other` folders in the display.
+
+View state is stored in `${XDG_STATE_HOME:-~/.config}/dupmap/state`. State is
+optional; inability to save it does not stop the program.
+
+## Install
 
 ```sh
 sudo make install
 ```
 
-The project also supports CMake:
-
-```sh
-cmake -S . -B build-cmake
-cmake --build build-cmake
-sudo cmake --install build-cmake
-```
-
-When launched without an explicit path, dupmap remembers the last directory,
-sort mode, color mode, and view mode in `${XDG_STATE_HOME:-~/.config}/dupmap/state`.
-The state file is optional and failures to write it do not affect scanning.
-
-## Release
-
-Linux release archives are built automatically when a `v*` tag is pushed. To
-publish the current version from a maintainer checkout:
-
-```sh
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the full test and development loop.
+This installs the executable and `dupmap.1` under `/usr/local` by default.
+Set `PREFIX` or `DESTDIR` to change the install location. To install with
+CMake, run `sudo cmake --install build-cmake`. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for development guidance and
+[CHANGELOG.md](CHANGELOG.md) for release history.

@@ -326,7 +326,7 @@ static int node_color(const Node *node, int depth) {
     return depth_color(depth);
 }
 
-static void draw_box(const Box *box, int selected, int depth) {
+static void draw_box(const Box *box, int selected, int depth, int pulse) {
     int color = node_color(box->node, depth);
     attron(COLOR_PAIR(color));
     for (int row = box->y; row < box->y + box->h; ++row) {
@@ -334,7 +334,7 @@ static void draw_box(const Box *box, int selected, int depth) {
     }
 
     int has_border = box->w >= 2 && box->h >= 2;
-    if (selected) attron(A_REVERSE | A_BOLD);
+    if (selected) attron(A_BOLD | (pulse ? A_REVERSE : 0));
     if (has_border) {
         mvaddch(box->y, box->x, ACS_ULCORNER);
         mvaddch(box->y, box->x + box->w - 1, ACS_URCORNER);
@@ -479,6 +479,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i <= 6; ++i) init_pair(i, i, -1);
     init_pair(7, COLOR_RED, -1);
     Node *current = root; size_t selected = 0; int list_mode = saved_list_mode; char filter[256] = "";
+    int pulse_frames = 0;
     for (;;) {
         int rows, cols; getmaxyx(stdscr, rows, cols); erase();
         char size_text[32]; format_size(current->size, size_text, sizeof(size_text));
@@ -506,7 +507,7 @@ int main(int argc, char **argv) {
             if (filter[0] && !shown) mvprintw(3, 0, "No items match '%s'", filter);
         } else {
             if (selected >= boxes.count && boxes.count) selected = boxes.count - 1;
-            for (size_t i = 0; i < boxes.count; ++i) draw_box(&boxes.items[i], i == selected, 0);
+            for (size_t i = 0; i < boxes.count; ++i) draw_box(&boxes.items[i], i == selected, 0, pulse_frames > 1);
             if (boxes.count) selected_node = boxes.items[selected].node;
         }
         if (selected_node) {
@@ -517,7 +518,10 @@ int main(int argc, char **argv) {
         } else mvprintw(rows - 2, 0, "%s  (empty or inaccessible)", current->path);
         mvprintw(rows - 1, 0, "Legend: mode=%s | red=duplicate | folders show file count and percentage", color_name());
         refresh();
+        timeout(pulse_frames ? 70 : -1);
         int key = getch();
+        if (key == ERR) { --pulse_frames; continue; }
+        size_t previous_selection = selected;
         if (key == 'q' || key == 'Q') { free(boxes.items); break; }
         if (key == 'l' || key == 'L') { list_mode = !list_mode; selected = 0; }
         else if (key == 'f' || key == 'F') {
@@ -534,6 +538,7 @@ int main(int argc, char **argv) {
         else if ((key == KEY_BACKSPACE || key == 127 || key == 8) && current != root) {
             current = current->parent; selected = 0; filter[0] = '\0';
         }
+        pulse_frames = (!list_mode && selected != previous_selection) ? 4 : 0;
         free(boxes.items);
     }
     endwin(); save_state(root->path, sort_mode, color_mode, list_mode); free_duplicate_groups(duplicate_groups, duplicate_group_count); free_node(root); return EXIT_SUCCESS;
