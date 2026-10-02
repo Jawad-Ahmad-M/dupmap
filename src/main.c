@@ -256,6 +256,8 @@ static void layout_children(Node *parent, int x, int y, int w, int h, BoxList *b
     size_t start = 0;
     int left = x, top = y, width = w, height = h;
     while (start < parent->child_count && width > 0 && height > 0) {
+        while (start < parent->child_count && parent->children[start]->size <= 0) ++start;
+        if (start == parent->child_count) break;
         int horizontal = width >= height;
         int side = horizontal ? height : width;
         long double remaining_size = 0;
@@ -265,7 +267,7 @@ static void layout_children(Node *parent, int x, int y, int w, int h, BoxList *b
         size_t end = start, best_end = start;
         double best = 1e30;
         double row_area = 0;
-        while (end < parent->child_count) {
+        while (end < parent->child_count && parent->children[end]->size > 0) {
             double area = remaining_area * ((double)parent->children[end]->size / (double)remaining_size);
             row_area += area;
             double worst = 0;
@@ -277,22 +279,39 @@ static void layout_children(Node *parent, int x, int y, int w, int h, BoxList *b
             if (worst <= best || end == start) { best = worst; best_end = end; ++end; }
             else break;
         }
+        int row_extent = horizontal ? width : height;
+        if (best_end - start + 1 > (size_t)row_extent) best_end = start + (size_t)row_extent - 1;
         /* A horizontal row spans the available width and consumes height;
            a vertical row spans height and consumes width. */
+        long double row_weight = 0;
+        for (size_t i = start; i <= best_end; ++i) row_weight += parent->children[i]->size;
+        row_area = remaining_area * (double)(row_weight / remaining_size);
         double cross_side = horizontal ? width : height;
         int row_size = (int)(row_area / cross_side + 0.5);
         if (row_size < 1) row_size = 1;
         if (row_size > (horizontal ? height : width)) row_size = horizontal ? height : width;
+        size_t next_positive = best_end + 1;
+        while (next_positive < parent->child_count && parent->children[next_positive]->size <= 0) ++next_positive;
+        int cross_extent = horizontal ? height : width;
+        if (next_positive < parent->child_count && cross_extent > 1 && row_size >= cross_extent)
+            row_size = cross_extent - 1;
         int cursor = horizontal ? left : top;
-        double actual_row = 0;
-        for (size_t i = start; i <= best_end; ++i) actual_row += (double)parent->children[i]->size / (double)remaining_size * remaining_area;
+        int remaining_length = row_extent;
+        long double remaining_row_weight = row_weight;
         for (size_t i = start; i <= best_end; ++i) {
             Node *child = parent->children[i];
-            int length = (i == best_end) ? (horizontal ? left + width - cursor : top + height - cursor)
-                                         : (int)((actual_row * ((double)child->size / (double)(remaining_size))) / row_size + 0.5);
+            size_t items_after = best_end - i;
+            int length = remaining_length;
+            if (items_after) {
+                length = (int)((long double)remaining_length * child->size / remaining_row_weight + 0.5L);
+                if (length < 1) length = 1;
+                if (length > remaining_length - (int)items_after) length = remaining_length - (int)items_after;
+            }
             if (length < 1) length = 1;
             if (horizontal) { add_box(boxes, cursor, top, length, row_size, child, parent->size); cursor += length; }
             else { add_box(boxes, left, cursor, row_size, length, child, parent->size); cursor += length; }
+            remaining_length -= length;
+            remaining_row_weight -= child->size;
         }
         if (horizontal) { top += row_size; height -= row_size; }
         else { left += row_size; width -= row_size; }
@@ -350,7 +369,7 @@ static void draw_box(const Box *box, int selected, int depth, int pulse) {
         if ((int)strlen(label) > max) { if (max > 3) { label[max - 3] = '.'; label[max - 2] = '.'; label[max - 1] = '.'; label[max] = '\0'; } else label[max] = '\0'; }
         mvaddnstr(label_row, start_x, label, max);
     }
-    attroff(A_REVERSE | A_BOLD); attroff(COLOR_PAIR(color));
+    attroff(A_REVERSE | A_BOLD); attroff(COLOR_PAIR(selected ? 8 : color));
 }
 
 static void format_size(off_t value, char *out, size_t length) {
