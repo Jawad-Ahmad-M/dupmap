@@ -9,16 +9,18 @@ static helpers without a separate library API.
 
 1. Parse `--help`, `--version`, `--dupes`, or the optional scan root.
 2. For interactive mode, initialize ncurses and report scan progress.
-3. Recursively build a tree of `Node` values. Each node owns its name, path,
-   and child vector; directory size and file count are aggregated from children
-   with saturation at the representable limits.
+3. Scan the full directory tree using metadata only. Nodes retain their addresses.
+   Totals saturate at representable limits and remain unknown for unreadable trees.
 4. Sort each directory by the active size, name, or modification-time mode.
-5. For duplicate detection, collect regular files, bucket by size, hash only
+5. On the first interactive D press (or immediately for `--dupes`),
+   collect regular files, bucket by size, hash only
    buckets with repeated sizes, and byte-compare candidates that also share a
-   hash. Hashes are a prefilter, never proof of equality.
-6. Convert visible children into terminal-cell rectangles. Squarified layout is
-   used for ordinary groups; a grid fallback caps work for very large groups.
-   If tiles would become too small, render a scrollable list instead.
+   hash. Hashes are a prefilter, never proof of equality. Cache even empty results
+   for the session. Startup and ordinary browsing do not read file contents.
+6. Build view rows from the real directory entries or scan-wide duplicate groups.
+   Dashboard and Folders use fixed 26-by-4 cards with vertically scrollable rows.
+   If a card cannot fit, use a list. Files and All items use lists; expanded
+   duplicate groups add independently scrollable member rows.
 7. Redraw after each input or resize, then free the duplicate groups and tree.
 
 ## Ownership and invariants
@@ -27,23 +29,29 @@ static helpers without a separate library API.
   are non-owning. `free_node` recursively releases the tree.
 - A `DuplicateGroup` owns its pointer array but refers to `Node` objects owned
   by the tree. Release the groups before releasing the tree.
-- `BoxList` owns its dynamic array; each box only refers to a tree node.
+- `ViewRows` owns its dynamic array; rows refer to tree nodes and group indices.
+- Each view has independent selection, viewport, and filter state. Directory
+  navigation resets filters; duplicate browsing keeps the directory unchanged.
 - Arrays grow through `grow_array`, which checks capacity and multiplication
   overflow before reallocating.
-- Layout coordinates are terminal cells. Emitted rectangles have positive
-  dimensions, remain within the requested viewport, and do not overlap.
+- Card dimensions are fixed terminal-cell counts. The selected row stays inside
+  the viewport after input, sorting, and resizing. Wide-character ncurses and
+  terminal-cell clipping keep Unicode labels within their allotted columns.
 
 ## Performance notes
 
-Tree construction and traversal are linear in the number of entries. Directory
-children are sorted once after scanning. Duplicate detection sorts all file
+Startup visits the full tree without reading file contents; navigation uses the
+cached tree. Metadata traversal is linear in the number of entries.
+Directory children are sorted after loading and when navigation or sorting requests it. Duplicate detection sorts all file
 records by size, hashes only files in repeated-size buckets, and sorts those
 records by hash before exact comparisons. Typical work is O(n log n) plus file
 reads; pathological same-size/hash collisions can still require quadratic
-byte comparisons. Treemap layout falls back to a bounded grid when there are
-more than 256 positive-size children.
+byte comparisons. Reclaimable totals are cached for the UI after accounting
+for inode identity and hard links outside each group. View rows are rebuilt
+from the current entries; rendering visits only the visible page.
 
-The UI is intentionally synchronous: scanning and duplicate checks happen on
-the UI thread, with periodic progress redraws. Large or slow filesystems can
-therefore delay keyboard input until the current operation reaches its next
-progress update or completes.
+The UI is intentionally synchronous: metadata scanning and requested duplicate checks happen on
+the UI thread, with loading redraws limited to ten per second. The loading screen
+shows phase, path, entries, elapsed time, and an activity indicator. Progress
+updates poll Q to quit and handle resizing, including during hashing and byte
+comparison of large files. A blocked filesystem call can delay the next update.

@@ -1,13 +1,19 @@
 .TH DUPMAP 1 "September 2026" "dupmap 0.1.0" "User Commands"
 .SH NAME
-dupmap \- terminal disk usage treemap and duplicate report
+dupmap \- terminal disk usage dashboard and duplicate report
 .SH SYNOPSIS
 .B dupmap
 .RI [ options ] [ path ]
 .SH DESCRIPTION
 .B dupmap
-recursively scans a directory and displays its contents as a navigable
-terminal treemap. Small files are grouped in a navigable \fBother\fR folder.
+scans directory metadata at startup and displays the contents as a navigable
+monochrome terminal dashboard. Fixed-size folder cards scroll vertically;
+files and duplicate groups have separate views. Small files remain in their
+real directories. Folder sizes are available after the initial scan, except
+for unreadable trees. File contents are checked only when D is pressed.
+The loading screen shows progress and elapsed time; Q quits during scanning.
+The directory tree and duplicate results are cached for the session.
+Wide-character ncurses supports Unicode names.
 .SH OPTIONS
 .TP
 .B --dupes [path]
@@ -24,28 +30,35 @@ Show the program version.
 Select an item.
 .TP
 .B Page Up / Page Down
-Move one visible page at a time in list view.
+Move one visible page at a time.
 .TP
 .B Home / End
-Select the first or last list entry.
+Select the first or last entry.
 .TP
 .B Enter
-Open the selected directory.
+Open the selected directory or expand/collapse a duplicate group.
 .TP
 .B Backspace
 Return to the parent directory.
 .TP
+.B 1 / 2 / 3
+Open Dashboard, Folders, or Files.
+.TP
+.B d
+Check duplicates on the first press, then open cached scan-wide groups with
+scrollable member paths. Startup and ordinary browsing skip content checks.
+.TP
+.B Escape
+Return from duplicates, close help, or cancel filter editing.
+.TP
 .B l
-Toggle the complete list view.
+Open All items with direct folders and files together.
 .TP
 .B f
-Enter a filename filter in list view.
+Edit the current view's filter. Enter applies, Escape cancels, Ctrl-U clears.
 .TP
 .B s
 Cycle size, name, and modified-time sorting.
-.TP
-.B c
-Cycle depth, file-type, and size-heat colors when the terminal supports color.
 .TP
 .B ?
 Show keyboard help. Press ? or Escape to return.
@@ -56,7 +69,7 @@ Quit.
 Symbolic links are skipped and are never followed. Directories that cannot be
 read are displayed as inaccessible instead of terminating the scan.
 .SH STATE
-When no path is supplied, the last directory and display modes are loaded from
+When no path is supplied, the last directory and sort mode are loaded from
 the dupmap state file under XDG_STATE_HOME, or ~/.config/dupmap/state.
 .SH AUTHOR
 Jawad Ahmad M
