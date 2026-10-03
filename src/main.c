@@ -3,6 +3,7 @@
 #include <dirent.h>
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <locale.h>
 #include <ncurses.h>
@@ -16,6 +17,17 @@
 #include <time.h>
 #include <unistd.h>
 #include <wchar.h>
+#include <wctype.h>
+
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+#ifndef O_DIRECTORY
+#define O_DIRECTORY 0
+#endif
+#ifndef O_NOFOLLOW
+#error "dupmap requires O_NOFOLLOW for safe filesystem access"
+#endif
 
 #define DUPMAP_VERSION "0.1.0"
 
@@ -35,6 +47,7 @@ struct Node {
     size_t child_cap;
 };
 
+/* A Box is one terminal-cell rectangle in the current treemap layout. */
 typedef struct { int x, y, w, h; Node *node; double percent; } Box;
 typedef struct { Box *items; size_t count, cap; } BoxList;
 typedef struct { Node **files; size_t count; off_t size; } DuplicateGroup;
@@ -136,6 +149,60 @@ static void die(const char *message) {
     exit(EXIT_FAILURE);
 }
 
+/* Grow vectors geometrically while checking every allocation multiplication. */
+static void *grow_array(void *items, size_t *capacity, size_t item_size,
+                        size_t initial_capacity) {
+    size_t next = *capacity ? *capacity : initial_capacity;
+    if (*capacity) {
+        if (*capacity > SIZE_MAX / 2) die("too many entries");
+        next = *capacity * 2;
+    }
+    if (!item_size || next > SIZE_MAX / item_size) die("too many entries");
+    void *grown = realloc(items, next * item_size);
+    if (!grown) die("out of memory");
+    *capacity = next;
+    return grown;
+}
+
+/* Replace terminal controls and malformed UTF-8 before rendering user names. */
+static void safe_terminal_text(const char *text, char *out, size_t out_size) {
+    if (!out_size) return;
+    size_t copied = 0;
+    mbstate_t state = {0};
+    while (*text && copied + 1 < out_size) {
+        wchar_t character;
+        size_t bytes = mbrtowc(&character, text, MB_CUR_MAX, &state);
+        if (bytes == (size_t)-1 || bytes == (size_t)-2) {
+            out[copied++] = '?';
+            ++text;
+            memset(&state, 0, sizeof(state));
+            continue;
+        }
+        if (!bytes) break;
+        if (iswcntrl(character)) out[copied++] = '?';
+        else {
+            if (copied + bytes >= out_size) break;
+            memcpy(out + copied, text, bytes);
+            copied += bytes;
+        }
+        text += bytes;
+    }
+    out[copied] = '\0';
+}
+
+/* O_NOFOLLOW blocks final-component symlinks; fstat rejects special files. */
+static int open_regular_file(const char *path) {
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        errno = EINVAL;
+        return -1;
+    }
+    return fd;
+}
+
 static off_t max_off_t_value(void) {
     unsigned shift = (unsigned)(sizeof(uintmax_t) * CHAR_BIT - sizeof(off_t) * CHAR_BIT + 1);
     return (off_t)(UINTMAX_MAX >> shift);
@@ -147,7 +214,9 @@ static void show_progress(const char *phase, const char *path) {
     getmaxyx(stdscr, rows, cols);
     if (rows < 1 || cols < 1) return;
     char message[PATH_MAX + 80];
-    snprintf(message, sizeof(message), "%s: %s  (%zu entries)", phase, path, ui_work_count);
+    char visible_path[PATH_MAX + 32];
+    safe_terminal_text(path, visible_path, sizeof(visible_path));
+    snprintf(message, sizeof(message), "%s: %s  (%zu entries)", phase, visible_path, ui_work_count);
     char clipped[PATH_MAX + 80];
     clip_text(message, cols, clipped, sizeof(clipped));
     mvaddnstr(rows - 1, 0, clipped, (int)strlen(clipped));
@@ -162,6 +231,7 @@ static char *copy_string(const char *s) {
 
 static char *join_path(const char *parent, const char *name) {
     size_t n = strlen(parent), m = strlen(name), slash = (n && parent[n - 1] != '/') ? 1 : 0;
+    if (m > SIZE_MAX - n || n + m > SIZE_MAX - slash - 1) die("path is too long");
     char *out = malloc(n + slash + m + 1);
     if (!out) die("out of memory");
     memcpy(out, parent, n);
@@ -182,11 +252,8 @@ static Node *new_node(const char *name, const char *path, int is_dir) {
 
 static void add_child(Node *parent, Node *child) {
     if (parent->child_count == parent->child_cap) {
-        size_t next = parent->child_cap ? parent->child_cap * 2 : 32;
-        Node **grown = realloc(parent->children, next * sizeof(*grown));
-        if (!grown) die("out of memory");
-        parent->children = grown;
-        parent->child_cap = next;
+        parent->children = grow_array(parent->children, &parent->child_cap,
+                                      sizeof(*parent->children), 32);
     }
     parent->children[parent->child_count++] = child;
     child->parent = parent;
@@ -221,12 +288,32 @@ static size_t child_index(Node *parent, Node *child) {
     return 0;
 }
 
-static void free_node(Node *node);
+/* Hashes only shortlist candidates; byte comparison remains authoritative. */
+typedef struct { Node *node; uint64_t hash; } HashedFile;
+typedef struct { HashedFile *items; size_t count, cap; } FileList;
+
+static int compare_hashed_files(const void *a, const void *b) {
+    const HashedFile *left = a, *right = b;
+    if (left->node->size < right->node->size) return -1;
+    if (left->node->size > right->node->size) return 1;
+    if (left->hash < right->hash) return -1;
+    if (left->hash > right->hash) return 1;
+    return strcmp(left->node->path, right->node->path);
+}
+
+static int compare_file_sizes(const void *a, const void *b) {
+    const HashedFile *left = a, *right = b;
+    if (left->node->size < right->node->size) return -1;
+    if (left->node->size > right->node->size) return 1;
+    return strcmp(left->node->path, right->node->path);
+}
 
 static uint64_t file_hash(const char *path) {
-    FILE *file = fopen(path, "rb");
-    if (!file) return 0;
-    uint64_t hash = UINT64_C(1469598103934665603);
+    int fd = open_regular_file(path);
+    if (fd < 0) return 0;
+    FILE *file = fdopen(fd, "rb");
+    if (!file) { close(fd); return 0; }
+    uint64_t hash = UINT64_C(14695981039346656037);
     unsigned char buffer[8192]; size_t got;
     while ((got = fread(buffer, 1, sizeof(buffer), file)) > 0)
         for (size_t i = 0; i < got; ++i) { hash ^= buffer[i]; hash *= UINT64_C(1099511628211); }
@@ -235,8 +322,18 @@ static uint64_t file_hash(const char *path) {
 }
 
 static int files_equal(const char *left_path, const char *right_path) {
-    FILE *left = fopen(left_path, "rb"), *right = fopen(right_path, "rb");
-    if (!left || !right) { if (left) fclose(left); if (right) fclose(right); return 0; }
+    int left_fd = open_regular_file(left_path), right_fd = open_regular_file(right_path);
+    if (left_fd < 0 || right_fd < 0) {
+        if (left_fd >= 0) close(left_fd);
+        if (right_fd >= 0) close(right_fd);
+        return 0;
+    }
+    FILE *left = fdopen(left_fd, "rb"), *right = fdopen(right_fd, "rb");
+    if (!left || !right) {
+        if (left) fclose(left); else close(left_fd);
+        if (right) fclose(right); else close(right_fd);
+        return 0;
+    }
     unsigned char a[8192], b[8192]; size_t na, nb; int equal = 1;
     do {
         na = fread(a, 1, sizeof(a), left); nb = fread(b, 1, sizeof(b), right);
@@ -246,18 +343,14 @@ static int files_equal(const char *left_path, const char *right_path) {
     fclose(left); fclose(right); return equal;
 }
 
-typedef struct { Node **items; size_t count, cap; } FileList;
 static void collect_files(Node *node, FileList *list) {
     ++ui_work_count;
     if ((ui_work_count & 255) == 0) show_progress("Collecting files", node->path);
     if (!node->is_dir) {
         if (list->count == list->cap) {
-            size_t next = list->cap ? list->cap * 2 : 64;
-            Node **grown = realloc(list->items, next * sizeof(*grown));
-            if (!grown) die("out of memory");
-            list->items = grown; list->cap = next;
+            list->items = grow_array(list->items, &list->cap, sizeof(*list->items), 64);
         }
-        list->items[list->count++] = node; return;
+        list->items[list->count++].node = node; return;
     }
     for (size_t i = 0; i < node->child_count; ++i) collect_files(node->children[i], list);
 }
@@ -265,41 +358,53 @@ static void collect_files(Node *node, FileList *list) {
 static size_t find_duplicate_groups(Node *root, DuplicateGroup **out) {
     FileList files = {0}; collect_files(root, &files);
     unsigned char *used = calloc(files.count, 1);
-    uint64_t *hashes = malloc(files.count * sizeof(*hashes));
     DuplicateGroup *groups = NULL; size_t count = 0, cap = 0;
-    if ((!used || !hashes) && files.count) die("out of memory");
-    for (size_t i = 0; i < files.count; ++i) {
-        hashes[i] = file_hash(files.items[i]->path);
-        ui_work_count = i + 1;
-        if ((i & 63) == 0) show_progress("Checking duplicates", files.items[i]->name);
-    }
-    for (size_t i = 0; i < files.count; ++i) {
-        if (used[i]) continue;
-        Node **matches = NULL; size_t match_count = 0, match_cap = 0;
-        for (size_t j = i; j < files.count; ++j) {
-            if (used[j] || files.items[j]->size != files.items[i]->size || hashes[j] != hashes[i]) continue;
-            int equal = match_count == 0 || files_equal(files.items[i]->path, files.items[j]->path);
-            if (!equal) continue;
-            if (match_count == match_cap) {
-                size_t next = match_cap ? match_cap * 2 : 4;
-                Node **grown = realloc(matches, next * sizeof(*grown));
-                if (!grown) die("out of memory");
-                matches = grown; match_cap = next;
+    if (!used && files.count) die("out of memory");
+    if (files.count > 1)
+        qsort(files.items, files.count, sizeof(*files.items), compare_file_sizes);
+    /* Size sort avoids opening unique-size files. Hash sort narrows exact
+       comparisons to same-size, same-hash buckets: typical work is O(n log n)
+       plus reads for repeated sizes and byte verification of likely matches. */
+    for (size_t size_bucket = 0; size_bucket < files.count;) {
+        size_t size_end = size_bucket + 1;
+        while (size_end < files.count &&
+               files.items[size_end].node->size == files.items[size_bucket].node->size) ++size_end;
+        if (size_end - size_bucket > 1) {
+            for (size_t i = size_bucket; i < size_end; ++i) {
+                files.items[i].hash = file_hash(files.items[i].node->path);
+                ui_work_count = i + 1;
+                if ((i & 63) == 0) show_progress("Checking duplicates", files.items[i].node->name);
             }
-            matches[match_count++] = files.items[j]; used[j] = 1;
+            qsort(files.items + size_bucket, size_end - size_bucket,
+                  sizeof(*files.items), compare_hashed_files);
+            for (size_t hash_bucket = size_bucket; hash_bucket < size_end;) {
+                size_t hash_end = hash_bucket + 1;
+                while (hash_end < size_end &&
+                       files.items[hash_end].hash == files.items[hash_bucket].hash) ++hash_end;
+                for (size_t i = hash_bucket; i < hash_end; ++i) {
+                    if (used[i]) continue;
+                    Node **matches = NULL; size_t match_count = 0, match_cap = 0;
+                    for (size_t j = i; j < hash_end; ++j) {
+                        if (used[j]) continue;
+                        int equal = match_count == 0 || files_equal(files.items[i].node->path, files.items[j].node->path);
+                        if (!equal) continue;
+                        if (match_count == match_cap)
+                            matches = grow_array(matches, &match_cap, sizeof(*matches), 4);
+                        matches[match_count++] = files.items[j].node;
+                        used[j] = 1;
+                    }
+                    if (match_count > 1) {
+                        for (size_t j = 0; j < match_count; ++j) matches[j]->is_duplicate = 1;
+                        if (count == cap) groups = grow_array(groups, &cap, sizeof(*groups), 8);
+                        groups[count++] = (DuplicateGroup){matches, match_count, files.items[i].node->size};
+                    } else free(matches);
+                }
+                hash_bucket = hash_end;
+            }
         }
-        if (match_count > 1) {
-            for (size_t j = 0; j < match_count; ++j) matches[j]->is_duplicate = 1;
-            if (count == cap) {
-                size_t next = cap ? cap * 2 : 8;
-                DuplicateGroup *grown = realloc(groups, next * sizeof(*grown));
-                if (!grown) die("out of memory");
-                groups = grown; cap = next;
-            }
-            groups[count++] = (DuplicateGroup){matches, match_count, files.items[i]->size};
-        } else free(matches);
+        size_bucket = size_end;
     }
-    free(hashes); free(used); free(files.items); *out = groups; return count;
+    free(used); free(files.items); *out = groups; return count;
 }
 
 static void free_duplicate_groups(DuplicateGroup *groups, size_t count) {
@@ -307,12 +412,16 @@ static void free_duplicate_groups(DuplicateGroup *groups, size_t count) {
     free(groups);
 }
 
+/* Build an owned tree from lstat results. Symlinks and special files are
+   excluded; directories are opened without following the final path component
+   and checked against lstat to avoid scanning a swapped directory. */
 static Node *scan_path(const char *path, const char *display_name, int is_root) {
     ++ui_work_count;
     if ((ui_work_count & 63) == 0) show_progress("Scanning", path);
     struct stat st;
     if (lstat(path, &st) != 0) return NULL;
     if (S_ISLNK(st.st_mode)) return NULL;
+    if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) { errno = ENOTSUP; return NULL; }
     if (!S_ISDIR(st.st_mode)) {
         Node *file = new_node(display_name, path, 0);
         file->size = st.st_size;
@@ -322,8 +431,16 @@ static Node *scan_path(const char *path, const char *display_name, int is_root) 
 
     Node *dir = new_node(display_name, path, 1);
     dir->modified = st.st_mtime;
-    DIR *handle = opendir(path);
-    if (!handle) { dir->inaccessible = 1; return dir; }
+    int directory_fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    struct stat opened_st;
+    if (directory_fd < 0 || fstat(directory_fd, &opened_st) != 0 ||
+        !S_ISDIR(opened_st.st_mode) || opened_st.st_dev != st.st_dev || opened_st.st_ino != st.st_ino) {
+        if (directory_fd >= 0) close(directory_fd);
+        dir->inaccessible = 1;
+        return dir;
+    }
+    DIR *handle = fdopendir(directory_fd);
+    if (!handle) { close(directory_fd); dir->inaccessible = 1; return dir; }
     struct dirent *entry;
     for (;;) {
         errno = 0;
@@ -393,12 +510,8 @@ static void free_node(Node *node) {
 
 static void add_box(BoxList *list, int x, int y, int w, int h, Node *node, off_t parent_size) {
     if (w < 1 || h < 1) return;
-    if (list->count == list->cap) {
-        size_t next = list->cap ? list->cap * 2 : 64;
-        Box *grown = realloc(list->items, next * sizeof(*grown));
-        if (!grown) die("out of memory");
-        list->items = grown; list->cap = next;
-    }
+    if (list->count == list->cap)
+        list->items = grow_array(list->items, &list->cap, sizeof(*list->items), 64);
     double percent = parent_size > 0 ? ((double)node->size * 100.0 / (double)parent_size) : 0.0;
     list->items[list->count++] = (Box){x, y, w, h, node, percent};
 }
@@ -410,11 +523,13 @@ static double aspect(double area, double short_side) {
 }
 
 static size_t layout_scaled(Node *parent, int x, int y, int w, int h, BoxList *boxes) {
-    size_t capacity = (size_t)w * (size_t)h, count = 0;
+    size_t capacity = SIZE_MAX, count = 0;
+    if ((size_t)w <= SIZE_MAX / (size_t)h) capacity = (size_t)w * (size_t)h;
     for (size_t i = 0; i < parent->child_count && count < capacity; ++i)
         if (parent->children[i]->size > 0) ++count;
     if (!count) return 0;
 
+    if (count > SIZE_MAX / sizeof(Node *)) die("too many tiles to lay out");
     Node **items = malloc(count * sizeof(*items));
     if (!items) die("out of memory");
     size_t used = 0;
@@ -494,7 +609,6 @@ static void layout_children(Node *parent, int x, int y, int w, int h, BoxList *b
         double row_area = 0;
         while (end < parent->child_count && parent->children[end]->size > 0) {
             double area = remaining_area * ((double)parent->children[end]->size / (double)remaining_size);
-            row_area += area;
             double worst = 0;
             for (size_t i = start; i <= end; ++i) {
                 double item_area = remaining_area * ((double)parent->children[i]->size / (double)remaining_size);
@@ -592,13 +706,14 @@ static void draw_box(const Box *box, int selected, int depth, int pulse) {
     if (w >= 3 && h >= 1) {
         int start_x = x;
         int label_row = y;
-        int max = w; char label[PATH_MAX + 64];
+        int max = w; char label[PATH_MAX + 64], visible_name[PATH_MAX + 64];
+        safe_terminal_text(box->node->name, visible_name, sizeof(visible_name));
         const char *mark = box->node->is_duplicate ? "* " : "";
         if (box->node->is_dir && w >= 18 && h >= 4)
-            snprintf(label, sizeof(label), "%s%s [%zu] %.1f%%", mark, box->node->name, box->node->file_count, box->percent);
-        else if (box->node->is_dir) snprintf(label, sizeof(label), "%s%s/ [%zu]", mark, box->node->name, box->node->file_count);
-        else if (w >= 18 && h >= 4) snprintf(label, sizeof(label), "%s%s  %.1f%%", mark, box->node->name, box->percent);
-        else snprintf(label, sizeof(label), "%s%s", mark, box->node->name);
+            snprintf(label, sizeof(label), "%s%s [%zu] %.1f%%", mark, visible_name, box->node->file_count, box->percent);
+        else if (box->node->is_dir) snprintf(label, sizeof(label), "%s%s/ [%zu]", mark, visible_name, box->node->file_count);
+        else if (w >= 18 && h >= 4) snprintf(label, sizeof(label), "%s%s  %.1f%%", mark, visible_name, box->percent);
+        else snprintf(label, sizeof(label), "%s%s", mark, visible_name);
         char clipped[PATH_MAX + 64];
         clip_text(label, max, clipped, sizeof(clipped));
         mvaddnstr(label_row, start_x, clipped, (int)strlen(clipped));
@@ -624,12 +739,12 @@ static const char *color_name(void) {
 static const char *keyboard_hint(int cols) {
     if (cols >= 100)
         return ui_color_enabled
-            ? "Arrows select  Enter open  Backspace up  l:list  f:filter  s:sort  c:color  ? help  q:quit"
-            : "Arrows select  Enter open  Backspace up  l:list  f:filter  s:sort  ? help  q:quit";
+            ? "Arrows move PgUp/Dn page Enter open Backspace up L list F filter S sort c:color ? help q:quit"
+            : "Arrows move PgUp/Dn page Enter open Backspace up L list F filter S sort ? help q:quit";
     if (cols >= 76)
         return ui_color_enabled
-            ? "Arrows  Enter  Backspace  L list  F filter  S sort  C color  ? help"
-            : "Arrows  Enter  Backspace  L list  F filter  S sort  ? help";
+            ? "Arrows move PgUp/Dn page Enter open L list F filter S sort c:color ? help"
+            : "Arrows move PgUp/Dn page Enter open L list F filter S sort ? help";
     if (cols >= 48)
         return ui_color_enabled
             ? "Arrows move  Enter open  Backspace up  L list  F filter  S sort  C color  ? help"
@@ -638,45 +753,98 @@ static const char *keyboard_hint(int cols) {
                       : "Arrows move  Enter open  ? help";
 }
 
-static int load_state(char *last_path, size_t path_length, int *saved_sort, int *saved_color, int *saved_list) {
+static int state_paths(char *directory, size_t directory_size,
+                       char *path, size_t path_size) {
     const char *base = getenv("XDG_STATE_HOME");
-    char state_path[PATH_MAX];
     int length;
-    if (base && *base) length = snprintf(state_path, sizeof(state_path), "%s/dupmap/state", base);
+    if (base && *base) {
+        if (base[0] != '/') return 0;
+        length = snprintf(directory, directory_size, "%s/dupmap", base);
+    }
     else {
         const char *home = getenv("HOME");
-        if (!home || !*home) return 0;
-        length = snprintf(state_path, sizeof(state_path), "%s/.config/dupmap/state", home);
+        if (!home || !*home || home[0] != '/') return 0;
+        length = snprintf(directory, directory_size, "%s/.config/dupmap", home);
     }
-    if (length < 0 || (size_t)length >= sizeof(state_path)) return 0;
-    FILE *file = fopen(state_path, "r");
+    if (length < 0 || (size_t)length >= directory_size) return 0;
+    size_t dir_length = (size_t)length;
+    if (dir_length > path_size || sizeof("/state") > path_size - dir_length) return 0;
+    memcpy(path, directory, dir_length);
+    memcpy(path + dir_length, "/state", sizeof("/state"));
+    return 1;
+}
+
+/* State lives in a private, user-owned directory and never controls file ops. */
+static int state_directory_is_safe(const char *directory) {
+    struct stat st;
+    return lstat(directory, &st) == 0 && S_ISDIR(st.st_mode) &&
+           st.st_uid == geteuid() && !(st.st_mode & (S_IWGRP | S_IWOTH));
+}
+
+static FILE *open_state_file(const char *path, int write_access) {
+    int flags = (write_access ? O_WRONLY | O_CREAT : O_RDONLY) |
+                O_CLOEXEC | O_NOFOLLOW;
+    int fd = open(path, flags, 0600);
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid() ||
+        fchmod(fd, 0600) != 0 || (write_access && ftruncate(fd, 0) != 0)) {
+        close(fd);
+        errno = EPERM;
+        return NULL;
+    }
+    FILE *file = fdopen(fd, write_access ? "w" : "r");
+    if (!file) close(fd);
+    return file;
+}
+
+/* Treat malformed preference data as optional state, not as trusted input. */
+static int read_state_modes(FILE *file, int *saved_sort, int *saved_color,
+                            int *saved_list) {
+    char line[128];
+    if (!fgets(line, sizeof(line), file) || (!strchr(line, '\n') && !feof(file))) return 0;
+    char *cursor = line;
+    long values[3];
+    for (size_t i = 0; i < 3; ++i) {
+        while (isspace((unsigned char)*cursor)) ++cursor;
+        errno = 0;
+        char *end;
+        values[i] = strtol(cursor, &end, 10);
+        if (errno || end == cursor || values[i] < 0 || values[i] > (i == 2 ? 1 : 2)) return 0;
+        cursor = end;
+    }
+    while (isspace((unsigned char)*cursor)) ++cursor;
+    if (*cursor) return 0;
+    *saved_sort = (int)values[0];
+    *saved_color = (int)values[1];
+    *saved_list = (int)values[2];
+    return 1;
+}
+
+static int load_state(char *last_path, size_t path_length, int *saved_sort, int *saved_color, int *saved_list) {
+    char state_dir[PATH_MAX], state_path[PATH_MAX];
+    if (!state_paths(state_dir, sizeof(state_dir), state_path, sizeof(state_path)) ||
+        !state_directory_is_safe(state_dir)) return 0;
+    FILE *file = open_state_file(state_path, 0);
     if (!file) return 0;
-    if (!fgets(last_path, (int)path_length, file)) { fclose(file); return 0; }
+    if (!fgets(last_path, (int)path_length, file) ||
+        (!strchr(last_path, '\n') && !feof(file))) { fclose(file); return 0; }
     last_path[strcspn(last_path, "\r\n")] = '\0';
-    int parsed = fscanf(file, "%d %d %d", saved_sort, saved_color, saved_list);
-    if (parsed != 3) { *saved_sort = 0; *saved_color = 0; *saved_list = 0; }
+    if (!read_state_modes(file, saved_sort, saved_color, saved_list))
+        *saved_sort = *saved_color = *saved_list = 0;
     fclose(file);
     struct stat st;
     return *last_path && stat(last_path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
 static void save_state(const char *last_path, int saved_sort, int saved_color, int saved_list) {
-    const char *base = getenv("XDG_STATE_HOME");
     char state_dir[PATH_MAX], state_path[PATH_MAX];
-    int length;
-    if (base && *base) length = snprintf(state_dir, sizeof(state_dir), "%s/dupmap", base);
-    else {
-        const char *home = getenv("HOME");
-        if (!home || !*home) return;
-        length = snprintf(state_dir, sizeof(state_dir), "%s/.config/dupmap", home);
-    }
-    if (length < 0 || (size_t)length >= sizeof(state_dir)) return;
+    /* The compact state format is line-oriented; don't persist ambiguous paths. */
+    if (strchr(last_path, '\n') || strchr(last_path, '\r')) return;
+    if (!state_paths(state_dir, sizeof(state_dir), state_path, sizeof(state_path))) return;
     if (mkdir(state_dir, 0700) != 0 && errno != EEXIST) return;
-    size_t directory_length = strlen(state_dir);
-    if (directory_length + strlen("/state") >= sizeof(state_path)) return;
-    memcpy(state_path, state_dir, directory_length);
-    memcpy(state_path + directory_length, "/state", strlen("/state") + 1);
-    FILE *file = fopen(state_path, "w");
+    if (!state_directory_is_safe(state_dir)) return;
+    FILE *file = open_state_file(state_path, 1);
     if (!file) return;
     fprintf(file, "%s\n%d %d %d\n", last_path, saved_sort, saved_color, saved_list);
     fclose(file);
@@ -713,6 +881,56 @@ static size_t list_window_start(Node *parent, size_t selected, int rows, const c
         if (name_matches(parent->children[first]->name, query)) ++preceding;
     }
     return first;
+}
+
+static size_t move_list_selection(Node *parent, size_t selected, int direction,
+                                  size_t steps, const char *query) {
+    if (!parent->child_count) return 0;
+    for (size_t step = 0; step < steps; ++step) {
+        if (query[0]) {
+            selected = next_match(parent, selected, direction, query);
+        } else if (direction > 0) {
+            if (selected + 1 >= parent->child_count) break;
+            ++selected;
+        } else {
+            if (!selected) break;
+            --selected;
+        }
+    }
+    return selected;
+}
+
+static size_t list_edge_selection(Node *parent, int last, const char *query) {
+    if (!parent->child_count) return 0;
+    if (last) {
+        for (size_t i = parent->child_count; i > 0; --i)
+            if (name_matches(parent->children[i - 1]->name, query)) return i - 1;
+    } else {
+        for (size_t i = 0; i < parent->child_count; ++i)
+            if (name_matches(parent->children[i]->name, query)) return i;
+    }
+    return 0;
+}
+
+static size_t advance_list_index(Node *parent, size_t index, int direction,
+                                 size_t steps, const char *query) {
+    if (!parent->child_count) return 0;
+    for (size_t step = 0; step < steps; ++step) {
+        int found = 0;
+        if (direction > 0) {
+            for (size_t i = index + 1; i < parent->child_count; ++i) {
+                if (!name_matches(parent->children[i]->name, query)) continue;
+                index = i; found = 1; break;
+            }
+        } else {
+            for (size_t i = index; i > 0; --i) {
+                if (!name_matches(parent->children[i - 1]->name, query)) continue;
+                index = i - 1; found = 1; break;
+            }
+        }
+        if (!found) break;
+    }
+    return index;
 }
 
 static size_t matching_count(Node *parent, const char *query) {
@@ -753,7 +971,9 @@ int main(int argc, char **argv) {
         while (root_length > 1 && root_check[root_length - 1] == '/') root_check[--root_length] = '\0';
         struct stat root_stat;
         if (lstat(root_check, &root_stat) == 0 && S_ISLNK(root_stat.st_mode)) {
-            fprintf(stderr, "dupmap: cannot read '%s': symbolic links are skipped\n", root_path);
+            char visible_path[PATH_MAX];
+            safe_terminal_text(root_path, visible_path, sizeof(visible_path));
+            fprintf(stderr, "dupmap: cannot read '%s': symbolic links are skipped\n", visible_path);
             return EXIT_FAILURE;
         }
     }
@@ -779,12 +999,16 @@ int main(int argc, char **argv) {
     Node *root = scan_path(root_path, root_path, 1);
     if (!root) {
         if (ui_active) { endwin(); ui_active = 0; }
-        fprintf(stderr, "dupmap: cannot read '%s': %s\n", root_path, strerror(errno));
+        char visible_path[PATH_MAX];
+        safe_terminal_text(root_path, visible_path, sizeof(visible_path));
+        fprintf(stderr, "dupmap: cannot read '%s': %s\n", visible_path, strerror(errno));
         return EXIT_FAILURE;
     }
     if (!dupes_mode && !root->is_dir) {
         endwin(); ui_active = 0; free_node(root);
-        fprintf(stderr, "dupmap: '%s' is not a directory\n", root_path);
+        char visible_path[PATH_MAX];
+        safe_terminal_text(root_path, visible_path, sizeof(visible_path));
+        fprintf(stderr, "dupmap: '%s' is not a directory\n", visible_path);
         return EXIT_FAILURE;
     }
     if (dupes_mode) {
@@ -797,7 +1021,11 @@ int main(int argc, char **argv) {
                                   ? max_size : groups[i].size * (off_t)copies;
             char size_text[32]; format_size(reclaimable, size_text, sizeof(size_text));
             printf("\n%s reclaimable (%zu files):\n", size_text, groups[i].count);
-            for (size_t j = 0; j < groups[i].count; ++j) printf("  %s\n", groups[i].files[j]->path);
+            for (size_t j = 0; j < groups[i].count; ++j) {
+                char visible_path[PATH_MAX];
+                safe_terminal_text(groups[i].files[j]->path, visible_path, sizeof(visible_path));
+                printf("  %s\n", visible_path);
+            }
         }
         free_duplicate_groups(groups, group_count); free_node(root); return EXIT_SUCCESS;
     }
@@ -806,8 +1034,10 @@ int main(int argc, char **argv) {
     ui_work_count = 0;
     show_progress("Checking duplicates", root_path);
     size_t duplicate_group_count = find_duplicate_groups(root, &duplicate_groups);
-    Node *current = root; size_t selected = 0; int list_mode = saved_list_mode; char filter[256] = "";
-    int pulse_frames = 0, help_mode = 0;
+    Node *current = root; size_t selected = 0, list_first = 0;
+    int list_mode = saved_list_mode, list_first_valid = 0;
+    char filter[256] = "";
+    int pulse_frames = 0, help_mode = 0, list_page_rows = 1, force_tiles = 0;
     BoxList boxes = {0};
     Node *layout_parent = NULL;
     int layout_cols = -1, layout_height = -1, layout_sort = -1;
@@ -826,7 +1056,9 @@ int main(int argc, char **argv) {
         int path_width = cols - 8 - size_width;
         if (path_width < 1) path_width = 1;
         char short_path[PATH_MAX + 8];
-        clip_tail(current->path, path_width, short_path, sizeof(short_path));
+        char visible_path[PATH_MAX + 8];
+        safe_terminal_text(current->path, visible_path, sizeof(visible_path));
+        clip_tail(visible_path, path_width, short_path, sizeof(short_path));
         char header[PATH_MAX + 32];
         snprintf(header, sizeof(header), "dupmap  %s", short_path);
         attron(A_BOLD);
@@ -842,10 +1074,13 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < current->child_count; ++i)
             if (current->children[i]->size > 0) ++visible_items;
         size_t cell_capacity = (size_t)cols * (size_t)view_height;
-        int over_capacity = current->child_count > cell_capacity;
+        /* Keep enough area for readable labels; otherwise prefer the list. */
+        int crowded = visible_items > cell_capacity / 24;
         int has_zero_size = visible_items < current->child_count;
-        int auto_list = cols < 48 || rows < 12 || over_capacity || has_zero_size;
-        int show_list = list_mode || auto_list;
+        int compact_terminal = cols < 48 || rows < 12;
+        int auto_list = compact_terminal || crowded || has_zero_size;
+        int can_force_tiles = crowded && !compact_terminal && !has_zero_size;
+        int show_list = list_mode || compact_terminal || has_zero_size || (crowded && !force_tiles);
         if (!show_list && (layout_parent != current || layout_cols != cols || layout_height != view_height || layout_sort != sort_mode)) {
             free(boxes.items);
             boxes = (BoxList){0};
@@ -858,9 +1093,9 @@ int main(int argc, char **argv) {
         Node *selected_node = NULL;
         if (help_mode) {
             const char *help_lines[] = {
-                "Keyboard help", "Arrows: move selection  Enter: open folder",
-                "Backspace: parent       L: toggle list view", "F: filter names         S: change sort",
-                ui_color_enabled ? "C: change colors        ?: close help" : "Colors unavailable        ?: close help",
+                "Arrows: move   PgUp/PgDn: page list", "Home/End: first/last  Enter: open",
+                "Backspace: parent  L: toggle list", "F: filter  S: sort",
+                ui_color_enabled ? "C: colors  ?: close help" : "?: close help",
                 "Q: quit"
             };
             int help_count = rows - footer_rows - 2;
@@ -872,10 +1107,40 @@ int main(int argc, char **argv) {
             int list_start = rows >= 10 ? 3 : view_y;
             int list_rows = rows - footer_rows - list_start;
             if (list_rows < 1) list_rows = 1;
-            size_t first = list_window_start(current, selected, list_rows, filter);
-            if (rows >= 10) mvprintw(2, 0, "Contents (%zu items)%s:", filter[0] ? matching_count(current, filter) : current->child_count,
-                                     auto_list && !list_mode ? (over_capacity ? " (too many items for tiles)" :
-                                     (has_zero_size ? " (zero-size items)" : " (compact terminal)")) : "");
+            list_page_rows = list_rows;
+            size_t total = filter[0] ? matching_count(current, filter) : current->child_count;
+            size_t first = list_first_valid ? list_first : list_window_start(current, selected, list_rows, filter);
+            if (first >= current->child_count) first = 0;
+            int selected_visible = 0;
+            size_t in_window = 0;
+            for (size_t i = first; i < current->child_count && in_window < (size_t)list_rows; ++i) {
+                if (!name_matches(current->children[i]->name, filter)) continue;
+                if (i == selected) selected_visible = 1;
+                ++in_window;
+            }
+            if (total && !selected_visible)
+                first = list_window_start(current, selected, list_rows, filter);
+            list_first = first;
+            list_first_valid = 1;
+            size_t first_position = 0;
+            for (size_t i = 0; i < first; ++i)
+                if (name_matches(current->children[i]->name, filter)) ++first_position;
+            if (rows >= 10) {
+                char heading[192];
+                const char *reason = auto_list && !list_mode
+                    ? (can_force_tiles ? " | crowded: l for tiles" :
+                       (has_zero_size ? " | zero-size items" : " | compact terminal")) : "";
+                size_t end_position = first_position;
+                if (total > first_position) {
+                    size_t remaining = total - first_position;
+                    end_position += remaining < (size_t)list_rows ? remaining : (size_t)list_rows;
+                }
+                if (total)
+                    snprintf(heading, sizeof(heading), "Contents %zu-%zu of %zu%s",
+                             first_position + 1, end_position, total, reason);
+                else snprintf(heading, sizeof(heading), "Contents 0 items%s", reason);
+                mvaddnstr(2, 0, heading, cols);
+            }
             size_t shown = 0;
             for (size_t i = first; i < current->child_count && shown < (size_t)list_rows; ++i) {
                 Node *item = current->children[i]; char item_size[32]; format_size(item->size, item_size, sizeof(item_size));
@@ -883,7 +1148,9 @@ int main(int argc, char **argv) {
                 int line = list_start + (int)shown;
                 if (line >= rows - footer_rows) break;
                 char entry[PATH_MAX + 64];
-                snprintf(entry, sizeof(entry), "%c %s%s  %s%s%s", i == selected ? '>' : ' ', item->is_dir ? "[D] " : "[F] ", item->name,
+                char visible_name[PATH_MAX + 64];
+                safe_terminal_text(item->name, visible_name, sizeof(visible_name));
+                snprintf(entry, sizeof(entry), "%c %s%s  %s%s%s", i == selected ? '>' : ' ', item->is_dir ? "[D] " : "[F] ", visible_name,
                          item_size, item->is_duplicate ? "  *" : "", item->inaccessible ? "  [permission denied]" : "");
                 if (ui_color_enabled && item->is_duplicate) attron(COLOR_PAIR(7));
                 if (i == selected) attron(A_REVERSE | A_BOLD);
@@ -904,13 +1171,15 @@ int main(int argc, char **argv) {
         if (help_mode) mvaddnstr(status_y, 0, "Help is open  |  ? or Esc closes", cols);
         else if (selected_node) {
             char selected_size[32], status[PATH_MAX + 96]; format_size(selected_node->size, selected_size, sizeof(selected_size));
+            char visible_name[PATH_MAX + 96];
+            safe_terminal_text(selected_node->name, visible_name, sizeof(visible_name));
             size_t position = 0, total = 0;
             for (size_t i = 0; i < current->child_count; ++i) {
                 if (!name_matches(current->children[i]->name, filter)) continue;
                 ++total;
                 if (i == selected) position = total;
             }
-            snprintf(status, sizeof(status), "%s  |  %s  |  %zu/%zu%s%s", selected_node->name, selected_size, position, total,
+            snprintf(status, sizeof(status), "%s  |  %s  |  %zu/%zu%s%s", visible_name, selected_size, position, total,
                      selected_node->inaccessible ? "  [permission denied]" : "",
                      selected_node->is_duplicate ? "  [duplicate]" : "");
             char clipped_status[PATH_MAX + 96];
@@ -935,28 +1204,47 @@ int main(int argc, char **argv) {
         if (key == 'q' || key == 'Q') break;
         if (key == '?' || (help_mode && key == 27)) help_mode = !help_mode;
         else if (help_mode) { /* Keep help visible until ? or Escape. */ }
-        else if (key == 'l' || key == 'L') { list_mode = !list_mode; }
+        else if (key == 'l' || key == 'L') {
+            if (show_list && can_force_tiles) { list_mode = 0; force_tiles = 1; }
+            else if (show_list && list_mode) { list_mode = 0; force_tiles = 0; }
+            else if (!show_list) { list_mode = 1; force_tiles = 0; }
+        }
         else if (key == 'f' || key == 'F') {
-            list_mode = 1; echo(); curs_set(1); mvprintw(rows - 1, 0, "Filter (empty clears): "); clrtoeol(); getnstr(filter, sizeof(filter) - 1); noecho(); curs_set(0); selected = 0;
+            list_mode = 1; echo(); curs_set(1); mvprintw(rows - 1, 0, "Filter (empty clears): "); clrtoeol(); getnstr(filter, sizeof(filter) - 1); noecho(); curs_set(0); selected = 0; list_first_valid = 0;
         }
         else if (key == 's' || key == 'S') {
             Node *anchor = selected_node;
             sort_mode = (sort_mode + 1) % 3;
             sort_children(current);
             if (anchor) selected = child_index(current, anchor);
+            list_first_valid = 0;
         }
         else if (ui_color_enabled && (key == 'c' || key == 'C')) { color_mode = (color_mode + 1) % 3; }
-        else if (show_list && (key == KEY_LEFT || key == KEY_UP)) { if (filter[0]) selected = next_match(current, selected, -1, filter); else if (selected) --selected; }
-        else if (show_list && (key == KEY_RIGHT || key == KEY_DOWN)) { if (filter[0]) selected = next_match(current, selected, 1, filter); else if (selected + 1 < current->child_count) ++selected; }
-        else if (show_list && (key == '\n' || key == KEY_ENTER) && selected_node && selected_node->is_dir && !selected_node->inaccessible) { current = selected_node; sort_children(current); selected = 0; filter[0] = '\0'; }
+        else if (show_list && (key == KEY_LEFT || key == KEY_UP)) selected = move_list_selection(current, selected, -1, 1, filter);
+        else if (show_list && (key == KEY_RIGHT || key == KEY_DOWN)) selected = move_list_selection(current, selected, 1, 1, filter);
+        else if (show_list && key == KEY_PPAGE) {
+            selected = move_list_selection(current, selected, -1, (size_t)list_page_rows, filter);
+            list_first = advance_list_index(current, list_first, -1, (size_t)list_page_rows, filter);
+            list_first_valid = 1;
+        }
+        else if (show_list && key == KEY_NPAGE) {
+            selected = move_list_selection(current, selected, 1, (size_t)list_page_rows, filter);
+            list_first = advance_list_index(current, list_first, 1, (size_t)list_page_rows, filter);
+            list_first_valid = 1;
+        }
+        else if (show_list && key == KEY_HOME) selected = list_edge_selection(current, 0, filter);
+        else if (show_list && key == KEY_END) selected = list_edge_selection(current, 1, filter);
+        else if (show_list && (key == '\n' || key == KEY_ENTER) && selected_node && selected_node->is_dir && !selected_node->inaccessible) { current = selected_node; sort_children(current); selected = 0; filter[0] = '\0'; list_first_valid = 0; force_tiles = 0; }
         else if (!show_list && (key == KEY_LEFT || key == KEY_UP)) { if (selected) --selected; }
         else if (!show_list && (key == KEY_RIGHT || key == KEY_DOWN)) { if (selected + 1 < boxes.count) ++selected; }
-        else if (!show_list && (key == '\n' || key == KEY_ENTER) && selected_node && selected_node->is_dir && !selected_node->inaccessible) { current = selected_node; sort_children(current); selected = 0; filter[0] = '\0'; }
+        else if (!show_list && (key == '\n' || key == KEY_ENTER) && selected_node && selected_node->is_dir && !selected_node->inaccessible) { current = selected_node; sort_children(current); selected = 0; filter[0] = '\0'; list_first_valid = 0; force_tiles = 0; }
         else if ((key == KEY_BACKSPACE || key == 127 || key == 8) && current != root) {
             Node *child = current;
             current = current->parent;
             selected = child_index(current, child);
             filter[0] = '\0';
+            list_first_valid = 0;
+            force_tiles = 0;
         }
         pulse_frames = (!show_list && selected != previous_selection) ? 4 : 0;
     }

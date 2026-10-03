@@ -57,6 +57,8 @@ and estimated reclaimable space, then exits without starting the TUI.
 | Key | Action |
 | --- | --- |
 | Arrow keys | Select an item |
+| Page Up / Page Down | Move one visible list page at a time |
+| Home / End | Select the first or last list entry |
 | Enter | Open the selected folder |
 | Backspace | Go to the parent folder |
 | `l` | Toggle treemap/list view |
@@ -74,6 +76,12 @@ files have a red fill when colors are available and a `*` marker in all modes.
 On color terminals, selected tiles pulse between contrasting solid fills.
 Monochrome terminals use reverse video and omit color controls.
 
+Crowded folders open in a scrollable list automatically when tiles would have
+fewer than about 24 terminal cells each. Use Up/Down to move, Page Up/Page
+Down to move a screen at a time, and Home/End to jump to either end. The list
+header shows the visible range; press `l` to switch to tiles when the terminal
+has enough room.
+
 ## Data and limitations
 
 Scanning is recursive and follows the directory tree while skipping symlinks.
@@ -84,6 +92,10 @@ Files smaller than 4 KiB are grouped into `other` folders in the display.
 
 View state is stored in `${XDG_STATE_HOME:-~/.config}/dupmap/state`. State is
 optional; inability to save it does not stop the program.
+
+See [`docs/architecture.md`](docs/architecture.md) for the source and data-flow
+overview and [`docs/security.md`](docs/security.md) for the security review and
+operational limitations.
 
 ## Install
 

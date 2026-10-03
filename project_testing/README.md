@@ -28,7 +28,7 @@ All generated files live in a temporary directory.
 | Empty folder | Empty-state view | No crash or stray tiles; navigation and quit still work. |
 | Tiny-file boundaries | 0, 1, 4095, 4096, and 4097 byte files | Files below 4096 bytes appear inside a synthetic `other` folder; 4096 and 4097 byte files remain separate. |
 | Generated-name collision | Tiny file `other`, real directory `other (2)` | Both real entries stay intact; the synthetic tiny-file folder is named `other (3)`. |
-| Crowded directory | 300 entries with varied sizes | Tiles stay within bounds. At cramped sizes use list view; resizing should redraw cleanly. |
+| Crowded directory | 300 entries with varied sizes | It should open in a scrollable list. Check the visible range, arrow scrolling, Page Up/Down, Home/End, then press `l` to compare tiles and resize the terminal. |
 | Duplicate and near-match files | Identical content, empty duplicates, same-size different content | Identical files are marked; equal-size files with different bytes are not. Enter folders to inspect grouped tiny files. |
 | Deep directory tree | 24 nested folders and a spaced filename | Enter/Backspace navigation works and the path remains readable. |
 | Spaces, Unicode, and long filename | `café-東京.txt`, spaces, 180-character name | Names clip cleanly without corrupting the display or breaking selection. |
