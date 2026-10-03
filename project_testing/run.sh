@@ -74,10 +74,10 @@ while :; do
     IFS= read -r choice || exit 0
     case "$choice" in
         1) name=empty; hint='The empty folder has no file tiles. Check that the screen still explains the empty state.' ;;
-        2) name=tiny-boundaries; hint='Compare 4095, 4096, and 4097 bytes. Files below 4096 bytes are grouped under an “other” tile.' ;;
-        3) name=generated-name-collision; hint='The real file “other” and folder “other (2)” must remain visible; the synthetic group should use “other (3)”.' ;;
-        4) name=crowded; hint='Navigate and resize from a small terminal to a wide terminal. Tiles should stay inside the view; use list view with l when crowded.' ;;
-        5) name=duplicates; hint='Identical files should be marked as duplicates; equal-size alpha/bravo files must not be marked.' ;;
+        2) name=tiny-boundaries; hint='Press 3: every file remains directly in Files, including empty and small files.' ;;
+        3) name=generated-name-collision; hint='The real file other and directory other (2) remain in Files and Folders; L shows both.' ;;
+        4) name=crowded; hint='Press 3 to browse 300 files. Check paging, Home/End, filtering, and resizing.' ;;
+        5) name=duplicates; hint='Press D and expand groups. Identical and empty files belong together; alpha/bravo do not.' ;;
         6) name=deep-tree; hint='Use Enter to descend and Backspace to return. Check path clipping and selection across levels.' ;;
         7) name=names; hint='Check that Unicode and long names clip cleanly and remain selectable.' ;;
         q|Q) exit 0 ;;
