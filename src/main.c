@@ -707,7 +707,6 @@ static void layout_children(Node *parent, int x, int y, int w, int h, BoxList *b
         double best = 1e30;
         double row_area = 0;
         while (end < parent->child_count && parent->children[end]->size > 0) {
-            double area = remaining_area * ((double)parent->children[end]->size / (double)remaining_size);
             double worst = 0;
             for (size_t i = start; i <= end; ++i) {
                 double item_area = remaining_area * ((double)parent->children[i]->size / (double)remaining_size);
@@ -1364,10 +1363,9 @@ int main(int argc, char **argv) {
         }
         else if (show_list && key == KEY_HOME) selected = list_edge_selection(current, 0, filter);
         else if (show_list && key == KEY_END) selected = list_edge_selection(current, 1, filter);
-        else if (show_list && (key == '\n' || key == KEY_ENTER) && selected_node && selected_node->is_dir && !selected_node->inaccessible) { current = selected_node; sort_children(current); selected = 0; filter[0] = '\0'; list_first_valid = 0; force_tiles = 0; }
+        else if ((key == '\n' || key == KEY_ENTER) && selected_node && selected_node->is_dir && !selected_node->inaccessible) { current = selected_node; sort_children(current); selected = 0; filter[0] = '\0'; list_first_valid = 0; force_tiles = 0; }
         else if (!show_list && (key == KEY_LEFT || key == KEY_UP)) { if (selected) --selected; }
         else if (!show_list && (key == KEY_RIGHT || key == KEY_DOWN)) { if (selected + 1 < boxes.count) ++selected; }
-        else if (!show_list && (key == '\n' || key == KEY_ENTER) && selected_node && selected_node->is_dir && !selected_node->inaccessible) { current = selected_node; sort_children(current); selected = 0; filter[0] = '\0'; list_first_valid = 0; force_tiles = 0; }
         else if ((key == KEY_BACKSPACE || key == 127 || key == 8) && current != root) {
             Node *child = current;
             current = current->parent;
