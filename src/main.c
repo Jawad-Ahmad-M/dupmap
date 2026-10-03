@@ -35,8 +35,8 @@ typedef struct Node Node;
 /*
  * One entry in the scanned filesystem tree. Directories own their child
  * nodes; parent is a non-owning link used when navigating upward. Directory
- * size and file_count are aggregates; for files they describe the file itself.
- * Synthetic "other" directories group tiny files for display.
+ * size and file_count are aggregates; size_known marks complete totals.
+ * children_loaded records the cached directory snapshot.
  */
 struct Node {
     char *name;
@@ -46,6 +46,8 @@ struct Node {
     int is_dir;
     int inaccessible;
     int is_duplicate;
+    int children_loaded;
+    int size_known;
     time_t modified;
     dev_t device;
     ino_t inode;
@@ -56,15 +58,11 @@ struct Node {
     size_t child_cap;
 };
 
-/* A Box is one terminal-cell rectangle in the current treemap layout. */
-typedef struct { int x, y, w, h; Node *node; double percent; } Box;
-typedef struct { Box *items; size_t count, cap; } BoxList;
 typedef struct { Node **files; size_t count; off_t size; } DuplicateGroup;
 static int sort_mode = 0; /* 0 size, 1 name, 2 modified */
-static int color_mode = 0; /* 0 depth, 1 file type, 2 size heat */
 static int ui_active;
 static size_t ui_work_count;
-static int ui_color_enabled;
+static struct timespec ui_progress_started, ui_progress_last;
 
 static size_t next_character(const char *text, mbstate_t *state, int *cells) {
     /*
@@ -109,23 +107,22 @@ static int text_width(const char *text) {
 static void clip_text(const char *text, int width, char *out, size_t out_size) {
     if (!out_size) return;
     if (width <= 0) { out[0] = '\0'; return; }
-    if (text_width(text) <= width) {
-        snprintf(out, out_size, "%s", text);
-        return;
-    }
-    int budget = width > 3 ? width - 3 : width;
+    int ellipsis = text_width(text) > width && width > 3 && out_size >= 4;
+    int budget = width - (ellipsis ? 3 : 0);
     size_t copied = 0;
     mbstate_t state = {0};
     int used = 0, cells;
     while (*text) {
         size_t bytes = next_character(text, &state, &cells);
-        if (!bytes || used + cells > budget || copied + bytes + 4 > out_size) break;
+        size_t remaining = out_size - copied;
+        if (!bytes || used + cells > budget || bytes >= remaining ||
+            (ellipsis && remaining - bytes < 4)) break;
         memcpy(out + copied, text, bytes);
         copied += bytes;
         used += cells;
         text += bytes;
     }
-    if (width > 3 && copied + 4 <= out_size) {
+    if (ellipsis && copied + 4 <= out_size) {
         memcpy(out + copied, "...", 4);
     } else out[copied] = '\0';
 }
@@ -133,7 +130,7 @@ static void clip_text(const char *text, int width, char *out, size_t out_size) {
 /* Preserve the end of a path, since its final components identify the location. */
 static void clip_tail(const char *text, int width, char *out, size_t out_size) {
     if (!out_size) return;
-    if (text_width(text) <= width) { snprintf(out, out_size, "%s", text); return; }
+    if (text_width(text) <= width) { clip_text(text, width, out, out_size); return; }
     if (width <= 3) { clip_text(text, width, out, out_size); return; }
     int budget = width - 3;
     size_t offset = 0;
@@ -146,19 +143,18 @@ static void clip_tail(const char *text, int width, char *out, size_t out_size) {
         offset += bytes;
         suffix_width -= cells;
     }
-    snprintf(out, out_size, "...%s", text + offset);
-}
-
-static int tile_selection_attrs(int selected, int colors, int pulse) {
-    if (!selected) return 0;
-    int attrs = A_BOLD;
-    if (!colors) attrs |= A_REVERSE;
-    (void)pulse;
-    return attrs;
-}
-
-static int tile_color_pair(int selected, int pulse, int color) {
-    return selected ? (pulse ? 9 : 8) : color;
+    if (out_size < 4) { clip_text(text + offset, width, out, out_size); return; }
+    memcpy(out, "...", 3);
+    size_t copied = 3;
+    state = (mbstate_t){0};
+    while (text[offset]) {
+        size_t bytes = next_character(text + offset, &state, &cells);
+        if (!bytes || bytes >= out_size - copied) break;
+        memcpy(out + copied, text + offset, bytes);
+        copied += bytes;
+        offset += bytes;
+    }
+    out[copied] = '\0';
 }
 
 static void die(const char *message) {
@@ -229,20 +225,53 @@ static off_t max_off_t_value(void) {
     return (off_t)(UINTMAX_MAX >> shift);
 }
 
-/* Update the last terminal row during long scans without exposing raw filenames. */
+/* Throttle loading redraws; poll input so long operations can be quit. */
 static void show_progress(const char *phase, const char *path) {
     if (!ui_active) return;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    double since_draw = (double)(now.tv_sec - ui_progress_last.tv_sec) +
+                        (now.tv_nsec - ui_progress_last.tv_nsec) / 1e9;
+    if (since_draw < 0.1) return;
+    ui_progress_last = now;
+    double elapsed = (double)(now.tv_sec - ui_progress_started.tv_sec) +
+                     (now.tv_nsec - ui_progress_started.tv_nsec) / 1e9;
+    nodelay(stdscr, TRUE);
+    int key = getch();
+    nodelay(stdscr, FALSE);
+    if (key == 'q' || key == 'Q') { endwin(); exit(EXIT_SUCCESS); }
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
     if (rows < 1 || cols < 1) return;
     char message[PATH_MAX + 80];
     char visible_path[PATH_MAX + 32];
     safe_terminal_text(path, visible_path, sizeof(visible_path));
-    snprintf(message, sizeof(message), "%s: %s  (%zu entries)", phase, visible_path, ui_work_count);
+    erase();
+    snprintf(message, sizeof(message), "%c %s", "|/-\\"[(unsigned)(elapsed * 10) % 4], phase);
     char clipped[PATH_MAX + 80];
     clip_text(message, cols, clipped, sizeof(clipped));
-    mvaddnstr(rows - 1, 0, clipped, (int)strlen(clipped));
+    mvaddnstr(0, 0, clipped, (int)strlen(clipped));
+    if (rows > 2) {
+        snprintf(message, sizeof(message), "Entries processed: %zu | Elapsed: %.1fs", ui_work_count, elapsed);
+        clip_text(message, cols, clipped, sizeof(clipped));
+        mvaddnstr(2, 0, clipped, (int)strlen(clipped));
+    }
+    if (rows > 4) {
+        clip_tail(visible_path, cols, clipped, sizeof(clipped));
+        mvaddnstr(4, 0, clipped, (int)strlen(clipped));
+    }
+    if (rows > 6) {
+        clip_text("Working... Q to quit", cols, clipped, sizeof(clipped));
+        mvaddnstr(6, 0, clipped, (int)strlen(clipped));
+    }
     refresh();
+}
+
+static void begin_progress(const char *phase, const char *path) {
+    ui_work_count = 0;
+    clock_gettime(CLOCK_MONOTONIC, &ui_progress_started);
+    ui_progress_last = (struct timespec){0};
+    show_progress(phase, path);
 }
 
 /* Return a heap-owned copy; allocation failures use the common fatal path. */
@@ -310,13 +339,6 @@ static void sort_children(Node *parent) {
         qsort(parent->children, parent->child_count, sizeof(*parent->children), compare_nodes);
 }
 
-/* Find a node again after sorting so selection stays attached to that node. */
-static size_t child_index(Node *parent, Node *child) {
-    for (size_t i = 0; i < parent->child_count; ++i)
-        if (parent->children[i] == child) return i;
-    return 0;
-}
-
 /* Hashes only shortlist candidates; byte comparison remains authoritative. */
 typedef struct { Node *node; uint64_t hash; } HashedFile;
 typedef struct { HashedFile *items; size_t count, cap; } FileList;
@@ -345,8 +367,11 @@ static uint64_t file_hash(const char *path) {
     if (!file) { close(fd); return 0; }
     uint64_t hash = UINT64_C(14695981039346656037);
     unsigned char buffer[8192]; size_t got;
-    while ((got = fread(buffer, 1, sizeof(buffer), file)) > 0)
+    size_t chunks = 0;
+    while ((got = fread(buffer, 1, sizeof(buffer), file)) > 0) {
         for (size_t i = 0; i < got; ++i) { hash ^= buffer[i]; hash *= UINT64_C(1099511628211); }
+        if ((++chunks & 127) == 0) show_progress("Hashing files", path);
+    }
     int failed = ferror(file); fclose(file);
     return failed ? 0 : hash;
 }
@@ -366,8 +391,10 @@ static int files_equal(const char *left_path, const char *right_path) {
         return 0;
     }
     unsigned char a[8192], b[8192]; size_t na, nb; int equal = 1;
+    size_t chunks = 0;
     do {
         na = fread(a, 1, sizeof(a), left); nb = fread(b, 1, sizeof(b), right);
+        if ((++chunks & 127) == 0) show_progress("Comparing files", left_path);
         if (na != nb || memcmp(a, b, na) != 0) { equal = 0; break; }
     } while (na > 0);
     if (ferror(left) || ferror(right)) equal = 0;
@@ -485,109 +512,85 @@ static off_t duplicate_reclaimable_size(const DuplicateGroup *group) {
         ? max_size : group->size * (off_t)reclaimable;
 }
 
-/* Build an owned tree from lstat results. Symlinks and special files are
-   excluded; directories are opened without following the final path component
-   and checked against lstat to avoid scanning a swapped directory. */
-static Node *scan_path(const char *path, const char *display_name, int is_root) {
+/* Directory totals remain incomplete until every descendant is loaded. */
+static void update_totals(Node *dir) {
+    dir->size = 0;
+    dir->file_count = 0;
+    dir->size_known = dir->children_loaded && !dir->inaccessible;
+    off_t maximum = max_off_t_value();
+    for (size_t i = 0; i < dir->child_count; ++i) {
+        Node *child = dir->children[i];
+        if (!child->size_known) dir->size_known = 0;
+        dir->size = dir->size > maximum - child->size ? maximum : dir->size + child->size;
+        dir->file_count = child->file_count > SIZE_MAX - dir->file_count
+            ? SIZE_MAX : dir->file_count + child->file_count;
+    }
+}
+
+/* Only classify an entry; directory contents are loaded separately. */
+static Node *scan_entry(const char *path, const char *display_name) {
     ++ui_work_count;
-    if ((ui_work_count & 63) == 0) show_progress("Scanning", path);
-    /* lstat classifies the entry itself; symlinks are deliberately not traversed. */
+    show_progress("Scanning folders", path);
     struct stat st;
     if (lstat(path, &st) != 0) return NULL;
     if (S_ISLNK(st.st_mode)) return NULL;
     if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) { errno = ENOTSUP; return NULL; }
-    if (!S_ISDIR(st.st_mode)) {
-        Node *file = new_node(display_name, path, 0);
-        file->size = st.st_size;
-        file->modified = st.st_mtime;
-        file->device = st.st_dev;
-        file->inode = st.st_ino;
-        file->link_count = st.st_nlink;
-        return file;
-    }
+    Node *node = new_node(display_name, path, S_ISDIR(st.st_mode));
+    node->modified = st.st_mtime;
+    node->device = st.st_dev;
+    node->inode = st.st_ino;
+    node->link_count = st.st_nlink;
+    if (!node->is_dir) { node->size = st.st_size; node->size_known = 1; }
+    return node;
+}
 
-    Node *dir = new_node(display_name, path, 1);
-    dir->modified = st.st_mtime;
-    /* Compare the opened inode with lstat to detect replacement between calls. */
-    int directory_fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+/* Load once, retaining node addresses used by selections and duplicate groups.
+   Verify the original inode and never follow a replacement symlink. */
+static void load_children(Node *dir) {
+    if (!dir->is_dir || dir->children_loaded) return;
+    dir->children_loaded = 1;
+    int directory_fd = open(dir->path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     struct stat opened_st;
     if (directory_fd < 0 || fstat(directory_fd, &opened_st) != 0 ||
-        !S_ISDIR(opened_st.st_mode) || opened_st.st_dev != st.st_dev || opened_st.st_ino != st.st_ino) {
+        !S_ISDIR(opened_st.st_mode) || opened_st.st_dev != dir->device || opened_st.st_ino != dir->inode) {
         if (directory_fd >= 0) close(directory_fd);
         dir->inaccessible = 1;
-        return dir;
-    }
-    /* fdopendir takes ownership of directory_fd; closedir releases it below. */
-    DIR *handle = fdopendir(directory_fd);
-    if (!handle) { close(directory_fd); dir->inaccessible = 1; return dir; }
-    struct dirent *entry;
-    for (;;) {
-        errno = 0;
-        entry = readdir(handle);
-        if (!entry) { if (errno) dir->inaccessible = 1; break; }
-        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
-        char *child_path = join_path(path, entry->d_name);
-        Node *child = scan_path(child_path, entry->d_name, 0);
-        free(child_path);
-        if (child) add_child(dir, child);
-    }
-    if (closedir(handle) != 0) dir->inaccessible = 1;
-    /* Keep tiny files from producing unreadable one-cell boxes. Directories
-       are never grouped because they must remain independently navigable. */
-    /*
-     * Tiny regular files are visually indistinguishable in a treemap. Preserve
-     * them as children of a synthetic directory so their combined size is
-     * visible and users can still navigate into the group. Real directories
-     * remain separate because collapsing them would hide navigation targets.
-     */
-    const off_t tiny_limit = 4096;
-    Node **kept = dir->child_cap ? malloc(dir->child_cap * sizeof(*kept)) : NULL;
-    Node **tiny = dir->child_cap ? malloc(dir->child_cap * sizeof(*tiny)) : NULL;
-    if (dir->child_cap && (!kept || !tiny)) die("out of memory");
-    size_t kept_count = 0, tiny_count = 0;
-    for (size_t i = 0; i < dir->child_count; ++i) {
-        Node *child = dir->children[i];
-        if (!child->is_dir && child->size < tiny_limit) {
-            tiny[tiny_count++] = child;
-        } else kept[kept_count++] = child;
-    }
-    free(dir->children);
-    dir->children = NULL; dir->child_count = 0; dir->child_cap = 0; dir->size = 0; dir->file_count = 0;
-    for (size_t i = 0; i < kept_count; ++i) add_child(dir, kept[i]);
-    free(kept);
-    if (tiny_count > 0) {
-        /* Find a synthetic label that cannot shadow a real directory entry. */
-        char other_name[64] = "other";
-        unsigned suffix = 2;
-        for (;;) {
-            int in_use = 0;
-            for (size_t i = 0; i < dir->child_count; ++i)
-                if (!strcmp(dir->children[i]->name, other_name)) { in_use = 1; break; }
-            for (size_t i = 0; i < tiny_count && !in_use; ++i) {
-                if (strcmp(tiny[i]->name, other_name)) continue;
-                /* A real entry named like a synthetic group must stay visible
-                   as itself; move it out of the tiny-file group before trying
-                   the next available label. */
-                add_child(dir, tiny[i]);
-                memmove(&tiny[i], &tiny[i + 1], (tiny_count - i - 1) * sizeof(*tiny));
-                --tiny_count;
-                in_use = 1;
+    } else {
+        DIR *handle = fdopendir(directory_fd);
+        if (!handle) { close(directory_fd); dir->inaccessible = 1; }
+        else {
+            for (;;) {
+                errno = 0;
+                struct dirent *entry = readdir(handle);
+                if (!entry) { if (errno) dir->inaccessible = 1; break; }
+                if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+                char *child_path = join_path(dir->path, entry->d_name);
+                Node *child = scan_entry(child_path, entry->d_name);
+                free(child_path);
+                if (child) add_child(dir, child);
             }
-            if (!in_use) break;
-            snprintf(other_name, sizeof(other_name), "other (%u)", suffix++);
-        }
-        if (tiny_count) {
-            char *other_path = join_path(path, other_name);
-            Node *other = new_node(other_name, other_path, 1);
-            free(other_path);
-            for (size_t i = 0; i < tiny_count; ++i) add_child(other, tiny[i]);
-            add_child(dir, other);
+            if (closedir(handle) != 0) dir->inaccessible = 1;
         }
     }
-    free(tiny);
+    update_totals(dir);
     sort_children(dir);
-    (void)is_root;
-    return dir;
+}
+
+/* Complete metadata traversal only for an explicitly requested full scan. */
+static void load_tree(Node *node) {
+    if (!node->is_dir) return;
+    load_children(node);
+    for (size_t i = 0; i < node->child_count; ++i) load_tree(node->children[i]);
+    update_totals(node);
+}
+
+static Node *scan_path(const char *path, const char *display_name, int recursive) {
+    Node *node = scan_entry(path, display_name);
+    if (node && node->is_dir) {
+        if (recursive) { load_tree(node); sort_children(node); }
+        else load_children(node);
+    }
+    return node;
 }
 
 /* Recursively release the tree; each child is owned exactly once by its parent. */
@@ -597,233 +600,6 @@ static void free_node(Node *node) {
     free(node->children); free(node->name); free(node->path); free(node);
 }
 
-/* Append a drawable tile and calculate its share of the parent's byte total. */
-static void add_box(BoxList *list, int x, int y, int w, int h, Node *node, off_t parent_size) {
-    if (w < 1 || h < 1) return;
-    if (list->count == list->cap)
-        list->items = grow_array(list->items, &list->cap, sizeof(*list->items), 64);
-    double percent = parent_size > 0 ? ((double)node->size * 100.0 / (double)parent_size) : 0.0;
-    list->items[list->count++] = (Box){x, y, w, h, node, percent};
-}
-
-/* Return the aspect ratio a rectangle of area would have against a side. */
-static double aspect(double area, double short_side) {
-    if (short_side <= 0 || area <= 0) return 1e30;
-    double long_side = area / short_side;
-    return long_side > short_side ? long_side / short_side : short_side / long_side;
-}
-
-/* Lay out very large sibling sets in weighted rows with bounded layout work. */
-static size_t layout_scaled(Node *parent, int x, int y, int w, int h, BoxList *boxes) {
-    size_t capacity = SIZE_MAX, count = 0;
-    if ((size_t)w <= SIZE_MAX / (size_t)h) capacity = (size_t)w * (size_t)h;
-    for (size_t i = 0; i < parent->child_count && count < capacity; ++i)
-        if (parent->children[i]->size > 0) ++count;
-    if (!count) return 0;
-
-    if (count > SIZE_MAX / sizeof(Node *)) die("too many tiles to lay out");
-    Node **items = malloc(count * sizeof(*items));
-    if (!items) die("out of memory");
-    size_t used = 0;
-    long double remaining_weight = 0;
-    for (size_t i = 0; i < parent->child_count && used < count; ++i) {
-        if (parent->children[i]->size <= 0) continue;
-        items[used++] = parent->children[i];
-        remaining_weight += parent->children[i]->size;
-    }
-
-    int columns = 1;
-    while (columns < w && (long double)columns * columns * h < (long double)count * w) ++columns;
-    int min_columns = (int)((count + (size_t)h - 1) / (size_t)h);
-    if (columns < min_columns) columns = min_columns;
-    if ((size_t)columns > count) columns = (int)count;
-
-    int remaining_height = h, top = y;
-    size_t offset = 0;
-    while (offset < count) {
-        size_t row_count = count - offset;
-        if (row_count > (size_t)columns) row_count = (size_t)columns;
-        long double row_weight = 0;
-        for (size_t i = 0; i < row_count; ++i) row_weight += items[offset + i]->size;
-        size_t rows_after = (count - offset - row_count + (size_t)columns - 1) / (size_t)columns;
-        int row_height = rows_after ? (int)((long double)remaining_height * row_weight / remaining_weight + 0.5L)
-                                    : remaining_height;
-        if (row_height < 1) row_height = 1;
-        if (row_height > remaining_height - (int)rows_after) row_height = remaining_height - (int)rows_after;
-
-        int left = x, remaining_width = w;
-        long double width_weight = row_weight;
-        for (size_t i = 0; i < row_count; ++i) {
-            size_t after = row_count - i - 1;
-            int tile_width = remaining_width;
-            if (after) {
-                tile_width = (int)((long double)remaining_width * items[offset + i]->size / width_weight + 0.5L);
-                if (tile_width < 1) tile_width = 1;
-                if (tile_width > remaining_width - (int)after) tile_width = remaining_width - (int)after;
-            }
-            add_box(boxes, left, top, tile_width, row_height, items[offset + i], parent->size);
-            left += tile_width;
-            remaining_width -= tile_width;
-            width_weight -= items[offset + i]->size;
-        }
-        top += row_height;
-        remaining_height -= row_height;
-        remaining_weight -= row_weight;
-        offset += row_count;
-    }
-    free(items);
-    return count;
-}
-
-/*
- * Squarified treemap layout in terminal-cell coordinates. Children are already
- * sorted largest-first; each iteration extends a row while doing so improves
- * its worst aspect ratio, then consumes that strip of the remaining rectangle.
- * Zero-byte children receive no area and stay available in list mode.
- */
-static void layout_children(Node *parent, int x, int y, int w, int h, BoxList *boxes) {
-    if (!parent->child_count || w < 1 || h < 1) return;
-    size_t initial_count = boxes->count, positive_count = 0;
-    for (size_t i = 0; i < parent->child_count; ++i)
-        if (parent->children[i]->size > 0) ++positive_count;
-    /* The exact squarifier scans candidate rows repeatedly; use the scalable
-       weighted-row layout beyond this threshold to bound work on huge folders. */
-    if (positive_count > 256) {
-        layout_scaled(parent, x, y, w, h, boxes);
-        return;
-    }
-    size_t start = 0;
-    int left = x, top = y, width = w, height = h;
-    while (start < parent->child_count && width > 0 && height > 0) {
-        while (start < parent->child_count && parent->children[start]->size <= 0) ++start;
-        if (start == parent->child_count) break;
-        int horizontal = width >= height;
-        int side = horizontal ? height : width;
-        long double remaining_size = 0;
-        for (size_t i = start; i < parent->child_count; ++i) remaining_size += parent->children[i]->size;
-        if (remaining_size <= 0) break;
-        double remaining_area = (double)width * height;
-        size_t end = start, best_end = start;
-        double best = 1e30;
-        double row_area = 0;
-        while (end < parent->child_count && parent->children[end]->size > 0) {
-            double worst = 0;
-            for (size_t i = start; i <= end; ++i) {
-                double item_area = remaining_area * ((double)parent->children[i]->size / (double)remaining_size);
-                double ratio = aspect(item_area, side);
-                if (ratio > worst) worst = ratio;
-            }
-            if (worst <= best || end == start) { best = worst; best_end = end; ++end; }
-            else break;
-        }
-        int row_extent = horizontal ? width : height;
-        if (best_end - start + 1 > (size_t)row_extent) best_end = start + (size_t)row_extent - 1;
-        /* A horizontal row spans the available width and consumes height;
-           a vertical row spans height and consumes width. */
-        long double row_weight = 0;
-        for (size_t i = start; i <= best_end; ++i) row_weight += parent->children[i]->size;
-        row_area = remaining_area * (double)(row_weight / remaining_size);
-        double cross_side = horizontal ? width : height;
-        int row_size = (int)(row_area / cross_side + 0.5);
-        if (row_size < 1) row_size = 1;
-        if (row_size > (horizontal ? height : width)) row_size = horizontal ? height : width;
-        size_t next_positive = best_end + 1;
-        while (next_positive < parent->child_count && parent->children[next_positive]->size <= 0) ++next_positive;
-        int cross_extent = horizontal ? height : width;
-        if (next_positive < parent->child_count && cross_extent > 1 && row_size >= cross_extent)
-            row_size = cross_extent - 1;
-        int cursor = horizontal ? left : top;
-        int remaining_length = row_extent;
-        long double remaining_row_weight = row_weight;
-        for (size_t i = start; i <= best_end; ++i) {
-            Node *child = parent->children[i];
-            size_t items_after = best_end - i;
-            int length = remaining_length;
-            if (items_after) {
-                length = (int)((long double)remaining_length * child->size / remaining_row_weight + 0.5L);
-                if (length < 1) length = 1;
-                if (length > remaining_length - (int)items_after) length = remaining_length - (int)items_after;
-            }
-            if (length < 1) length = 1;
-            if (horizontal) { add_box(boxes, cursor, top, length, row_size, child, parent->size); cursor += length; }
-            else { add_box(boxes, left, cursor, row_size, length, child, parent->size); cursor += length; }
-            remaining_length -= length;
-            remaining_row_weight -= child->size;
-        }
-        if (horizontal) { top += row_size; height -= row_size; }
-        else { left += row_size; width -= row_size; }
-        start = best_end + 1;
-    }
-    size_t laid_out = boxes->count - initial_count;
-    /* If rounding left any positive-size item out, rebuild with the fallback layout. */
-    if (laid_out < positive_count) {
-        boxes->count = initial_count;
-        layout_scaled(parent, x, y, w, h, boxes);
-    }
-}
-
-static int depth_color(int depth) { return 1 + (depth % 6); }
-
-/* Assign palette categories from file extensions, with folders separate. */
-static int type_color(const Node *node) {
-    if (node->is_dir) return 6;
-    const char *dot = strrchr(node->name, '.');
-    if (!dot) return 5;
-    if (!strcasecmp(dot, ".c") || !strcasecmp(dot, ".h") || !strcasecmp(dot, ".cpp") || !strcasecmp(dot, ".py") || !strcasecmp(dot, ".js")) return 4;
-    if (!strcasecmp(dot, ".jpg") || !strcasecmp(dot, ".jpeg") || !strcasecmp(dot, ".png") || !strcasecmp(dot, ".gif") || !strcasecmp(dot, ".mp4")) return 2;
-    if (!strcasecmp(dot, ".zip") || !strcasecmp(dot, ".gz") || !strcasecmp(dot, ".tar") || !strcasecmp(dot, ".7z")) return 3;
-    return 5;
-}
-
-/* Map broad binary size bands to the palette used by heat-map mode. */
-static int heat_color(const Node *node) {
-    if (node->size >= (off_t)1024 * 1024 * 1024) return 1;
-    if (node->size >= (off_t)1024 * 1024) return 3;
-    if (node->size >= (off_t)1024) return 5;
-    return 6;
-}
-
-/* Duplicate highlighting takes precedence over the selected color scheme. */
-static int node_color(const Node *node, int depth) {
-    if (node->is_duplicate) return 7;
-    if (color_mode == 1) return type_color(node);
-    if (color_mode == 2) return heat_color(node);
-    return depth_color(depth);
-}
-
-/* Paint a tile background and label sized to the available terminal cells. */
-static void draw_box(const Box *box, int selected, int depth, int pulse) {
-    int color = node_color(box->node, depth);
-    int x = box->x, y = box->y, w = box->w, h = box->h;
-    /* Leave a cell gutter around roomy tiles; preserve every cell in tight layouts. */
-    if (w >= 6 && h >= 4) { ++x; ++y; w -= 2; h -= 2; }
-    int pair = ui_color_enabled ? COLOR_PAIR(tile_color_pair(selected, pulse, color)) : 0;
-    int selection = tile_selection_attrs(selected, ui_color_enabled, pulse);
-    attron(pair | selection);
-    for (int row = y; row < y + h; ++row) {
-        for (int col = x; col < x + w; ++col) mvaddch(row, col, ' ');
-    }
-
-    if (selected) attron(selection);
-    else if (box->node->is_dir) attron(A_BOLD);
-    if (w >= 3 && h >= 1) {
-        int start_x = x;
-        int label_row = y;
-        int max = w; char label[PATH_MAX + 64], visible_name[PATH_MAX + 64];
-        safe_terminal_text(box->node->name, visible_name, sizeof(visible_name));
-        const char *mark = box->node->is_duplicate ? "* " : "";
-        if (box->node->is_dir && w >= 18 && h >= 4)
-            snprintf(label, sizeof(label), "%s%s [%zu] %.1f%%", mark, visible_name, box->node->file_count, box->percent);
-        else if (box->node->is_dir) snprintf(label, sizeof(label), "%s%s/ [%zu]", mark, visible_name, box->node->file_count);
-        else if (w >= 18 && h >= 4) snprintf(label, sizeof(label), "%s%s  %.1f%%", mark, visible_name, box->percent);
-        else snprintf(label, sizeof(label), "%s%s", mark, visible_name);
-        char clipped[PATH_MAX + 64];
-        clip_text(label, max, clipped, sizeof(clipped));
-        mvaddnstr(label_row, start_x, clipped, (int)strlen(clipped));
-    }
-    attroff(A_REVERSE | A_BOLD | A_UNDERLINE); attroff(pair);
-}
-
 /* Format byte counts using binary units while keeping output bounded. */
 static void format_size(off_t value, char *out, size_t length) {
     const char *units[] = {"B", "K", "M", "G", "T", "P", "E"}; double size = (double)value; int unit = 0;
@@ -831,31 +607,13 @@ static void format_size(off_t value, char *out, size_t length) {
     snprintf(out, length, unit ? "%.1f %s" : "%.0f %s", size, units[unit]);
 }
 
+static void format_node_size(const Node *node, char *out, size_t length) {
+    if (node->is_dir && !node->size_known) snprintf(out, length, "not calculated");
+    else format_size(node->size, out, length);
+}
+
 static const char *sort_name(void) {
     return sort_mode == 1 ? "name" : (sort_mode == 2 ? "modified" : "size");
-}
-
-static const char *color_name(void) {
-    if (!ui_color_enabled) return "mono";
-    return color_mode == 1 ? "type" : (color_mode == 2 ? "heat" : "depth");
-}
-
-/* Choose a key summary that fits the current terminal width. */
-static const char *keyboard_hint(int cols) {
-    if (cols >= 100)
-        return ui_color_enabled
-            ? "Arrows move PgUp/Dn page Enter open Backspace up L list F filter S sort c:color ? help q:quit"
-            : "Arrows move PgUp/Dn page Enter open Backspace up L list F filter S sort ? help q:quit";
-    if (cols >= 76)
-        return ui_color_enabled
-            ? "Arrows move PgUp/Dn page Enter open L list F filter S sort c:color ? help"
-            : "Arrows move PgUp/Dn page Enter open L list F filter S sort ? help";
-    if (cols >= 48)
-        return ui_color_enabled
-            ? "Arrows move  Enter open  Backspace up  L list  F filter  S sort  C color  ? help"
-            : "Arrows move  Enter open  Backspace up  L list  F filter  S sort  ? help";
-    return cols >= 32 ? "Arrows move  Enter open  Backspace up  ? help"
-                      : "Arrows move  Enter open  ? help";
 }
 
 /* Resolve the per-user preference directory and state-file path. */
@@ -973,94 +731,386 @@ static int name_matches(const char *name, const char *query) {
     return 0;
 }
 
-/* Find the next matching sibling, wrapping at either end of the list. */
-static size_t next_match(Node *parent, size_t selected, int direction, const char *query) {
-    if (!parent->child_count) return 0;
-    size_t index = selected;
-    for (size_t step = 0; step < parent->child_count; ++step) {
-        if (direction > 0) index = (index + 1) % parent->child_count;
-        else index = index ? index - 1 : parent->child_count - 1;
-        if (name_matches(parent->children[index]->name, query)) return index;
-    }
-    return selected;
+enum View { VIEW_DASHBOARD, VIEW_FOLDERS, VIEW_FILES, VIEW_DUPLICATES, VIEW_ALL, VIEW_COUNT };
+enum { CARD_WIDTH = 26, CARD_HEIGHT = 4 };
+typedef struct { size_t selected, first; char filter[256]; } ViewState;
+typedef struct { Node *node; size_t group; int heading; } ViewRow;
+typedef struct { ViewRow *items; size_t count, cap; } ViewRows;
+
+static const char *view_name(enum View view) {
+    const char *names[] = {"Dashboard", "Folders", "Files", "Duplicates", "All items"};
+    return names[view];
 }
 
-/* Choose a viewport start that keeps the selected matching item on screen. */
-static size_t list_window_start(Node *parent, size_t selected, int rows, const char *query) {
-    if (!parent->child_count || rows <= 1) return selected;
-    if (selected >= parent->child_count) selected = parent->child_count - 1;
-    size_t first = selected;
-    int preceding = 0;
-    while (first > 0 && preceding < rows - 1) {
-        --first;
-        if (name_matches(parent->children[first]->name, query)) ++preceding;
-    }
-    return first;
+static int view_accepts_node(enum View view, const Node *node) {
+    return view == VIEW_ALL || (view == VIEW_FILES ? !node->is_dir :
+           ((view == VIEW_DASHBOARD || view == VIEW_FOLDERS) && node->is_dir));
 }
 
-/* Move by matching entries when filtered, or by sibling index otherwise. */
-static size_t move_list_selection(Node *parent, size_t selected, int direction,
-                                  size_t steps, const char *query) {
-    if (!parent->child_count) return 0;
-    for (size_t step = 0; step < steps; ++step) {
-        if (query[0]) {
-            selected = next_match(parent, selected, direction, query);
-        } else if (direction > 0) {
-            if (selected + 1 >= parent->child_count) break;
-            ++selected;
+static void add_view_row(ViewRows *rows, Node *node, size_t group, int heading) {
+    if (rows->count == rows->cap)
+        rows->items = grow_array(rows->items, &rows->cap, sizeof(*rows->items), 32);
+    rows->items[rows->count++] = (ViewRow){node, group, heading};
+}
+
+/* Duplicate membership is scan-wide. Expanded paths are individually scrollable. */
+static void build_view_rows(Node *current, enum View view, const char *filter,
+                            DuplicateGroup *groups, size_t group_count,
+                            size_t expanded, ViewRows *rows) {
+    rows->count = 0;
+    if (view != VIEW_DUPLICATES) {
+        for (size_t i = 0; i < current->child_count; ++i) {
+            Node *node = current->children[i];
+            if (view_accepts_node(view, node) && name_matches(node->name, filter))
+                add_view_row(rows, node, SIZE_MAX, 0);
+        }
+        return;
+    }
+    for (size_t i = 0; i < group_count; ++i) {
+        int matches = !filter[0];
+        for (size_t j = 0; j < groups[i].count && !matches; ++j)
+            matches = name_matches(groups[i].files[j]->path, filter);
+        if (!matches) continue;
+        add_view_row(rows, groups[i].files[0], i, 1);
+        if (i == expanded)
+            for (size_t j = 0; j < groups[i].count; ++j)
+                add_view_row(rows, groups[i].files[j], i, 0);
+    }
+}
+
+static int card_geometry(int width, int height, int *columns, int *rows) {
+    *columns = *rows = 0;
+    if (width < CARD_WIDTH || height < CARD_HEIGHT) return 0;
+    *columns = 1 + (width - CARD_WIDTH) / (CARD_WIDTH + 2);
+    *rows = 1 + (height - CARD_HEIGHT) / (CARD_HEIGHT + 1);
+    return 1;
+}
+
+/* Keep the selected item visible even when terminal dimensions change. */
+static void keep_visible(ViewState *state, size_t count, size_t page, size_t stride) {
+    if (!count) { state->selected = state->first = 0; return; }
+    if (state->selected >= count) state->selected = count - 1;
+    if (state->first >= count) state->first = 0;
+    state->first -= state->first % stride;
+    if (state->selected < state->first)
+        state->first = state->selected / stride * stride;
+    else if (state->selected - state->first >= page)
+        state->first = (state->selected - page + stride) / stride * stride;
+}
+
+static void select_anchor(const ViewRows *rows, ViewState *state, ViewRow anchor) {
+    for (size_t i = 0; i < rows->count; ++i)
+        if (rows->items[i].node == anchor.node && rows->items[i].group == anchor.group &&
+            rows->items[i].heading == anchor.heading) { state->selected = i; return; }
+}
+
+/* All directory tabs share the sorted children; preserve each tab's node. */
+static void sort_view_states(Node *current, ViewState states[VIEW_COUNT]) {
+    ViewRow anchors[VIEW_COUNT] = {0};
+    ViewRows rows = {0};
+    for (enum View view = VIEW_DASHBOARD; view < VIEW_COUNT; ++view) {
+        if (view == VIEW_DUPLICATES) continue;
+        build_view_rows(current, view, states[view].filter, NULL, 0, SIZE_MAX, &rows);
+        if (states[view].selected < rows.count) anchors[view] = rows.items[states[view].selected];
+    }
+    sort_children(current);
+    for (enum View view = VIEW_DASHBOARD; view < VIEW_COUNT; ++view) {
+        if (!anchors[view].node) continue;
+        build_view_rows(current, view, states[view].filter, NULL, 0, SIZE_MAX, &rows);
+        select_anchor(&rows, &states[view], anchors[view]);
+    }
+    free(rows.items);
+}
+
+/* Sanitize user names, then clip by terminal cells before any curses write. */
+static void draw_text(int y, int x, int width, const char *text) {
+    if (width <= 0) return;
+    char safe[PATH_MAX * 4 + 256], clipped[PATH_MAX * 4 + 256];
+    safe_terminal_text(text, safe, sizeof(safe));
+    clip_text(safe, width, clipped, sizeof(clipped));
+    mvaddnstr(y, x, clipped, (int)strlen(clipped));
+}
+
+static void draw_card(Node *node, int x, int y, int selected) {
+    int attrs = selected ? A_REVERSE | A_BOLD : A_NORMAL;
+    attron(attrs);
+    mvaddch(y, x, '+'); mvhline(y, x + 1, '-', CARD_WIDTH - 2);
+    mvaddch(y, x + CARD_WIDTH - 1, '+');
+    for (int row = 1; row < CARD_HEIGHT - 1; ++row) {
+        mvaddch(y + row, x, '|'); mvhline(y + row, x + 1, ' ', CARD_WIDTH - 2);
+        mvaddch(y + row, x + CARD_WIDTH - 1, '|');
+    }
+    mvaddch(y + CARD_HEIGHT - 1, x, '+');
+    mvhline(y + CARD_HEIGHT - 1, x + 1, '-', CARD_WIDTH - 2);
+    mvaddch(y + CARD_HEIGHT - 1, x + CARD_WIDTH - 1, '+');
+    draw_text(y + 1, x + 2, CARD_WIDTH - 4, node->name);
+    char size[32], detail[128]; format_size(node->size, size, sizeof(size));
+    if (node->inaccessible) snprintf(detail, sizeof(detail), "Cannot read folder");
+    else if (!node->size_known) snprintf(detail, sizeof(detail), "Size not calculated");
+    else snprintf(detail, sizeof(detail), "%s | %zu %s", size, node->file_count,
+                  node->file_count == 1 ? "file" : "files");
+    draw_text(y + 2, x + 2, CARD_WIDTH - 4, detail);
+    attroff(attrs);
+}
+
+static void filter_backspace(char *filter) {
+    size_t length = strlen(filter);
+    if (!length) return;
+    --length;
+    while (length && ((unsigned char)filter[length] & 0xC0) == 0x80) --length;
+    filter[length] = '\0';
+}
+
+static const char *keyboard_hint(int cols) {
+    if (cols >= 76) return "Arrows move | Enter open | Backspace up | F filter | S sort | ? help | Q quit";
+    if (cols >= 48) return "Enter open | Backspace up | F filter | ? help | Q quit";
+    return "Enter open | ? help | Q quit";
+}
+
+static int run_dashboard(Node *root) {
+    DuplicateGroup *groups = NULL;
+    size_t group_count = 0;
+    off_t *reclaimable = NULL;
+    int duplicates_checked = 0;
+    off_t total_reclaimable = 0, max_size = max_off_t_value();
+    Node *current = root;
+    enum View view = VIEW_DASHBOARD, previous_view = VIEW_DASHBOARD;
+    ViewState states[VIEW_COUNT] = {0};
+    ViewRows items = {0};
+    size_t expanded = SIZE_MAX;
+    int help = 0, editing = 0, have_anchor = 0;
+    ViewState before_edit = {0};
+    ViewRow anchor = {0};
+    for (;;) {
+        /* Reading file contents is deferred until D, then cached even if empty. */
+        if (view == VIEW_DUPLICATES && !duplicates_checked) {
+            begin_progress("Checking duplicates", root->path);
+            group_count = find_duplicate_groups(root, &groups);
+            if (group_count > SIZE_MAX / sizeof(*reclaimable)) die("too many duplicate groups");
+            reclaimable = group_count ? malloc(group_count * sizeof(*reclaimable)) : NULL;
+            if (group_count && !reclaimable) die("out of memory");
+            for (size_t i = 0; i < group_count; ++i) {
+                reclaimable[i] = duplicate_reclaimable_size(&groups[i]);
+                total_reclaimable = total_reclaimable > max_size - reclaimable[i]
+                    ? max_size : total_reclaimable + reclaimable[i];
+            }
+            duplicates_checked = 1;
+        }
+        ViewState *state = &states[view];
+        build_view_rows(current, view, state->filter, groups, group_count, expanded, &items);
+        if (have_anchor) { select_anchor(&items, state, anchor); have_anchor = 0; }
+        int rows, cols; getmaxyx(stdscr, rows, cols); erase();
+        int top = 3, body_height = rows - top - 3;
+        int columns = 1, card_rows = 0, cards = 0;
+        size_t page = 1;
+        if (rows < 7 || cols < 16) {
+            draw_text(0, 0, cols, "Terminal too small; resize or Q quit");
+            keep_visible(state, items.count, 1, 1);
         } else {
-            if (!selected) break;
-            --selected;
+            char safe_path[PATH_MAX * 4], path[PATH_MAX * 4];
+            safe_terminal_text(view == VIEW_DUPLICATES ? root->path : current->path, safe_path, sizeof(safe_path));
+            clip_tail(safe_path, cols - 9, path, sizeof(path));
+            attron(A_BOLD); draw_text(0, 0, 7, "dupmap"); attroff(A_BOLD);
+            draw_text(0, 8, cols - 8, path);
+            draw_text(1, 0, cols, cols >= 62
+                ? "1 Dashboard | 2 Folders | 3 Files | D Duplicates | L All items"
+                : "1 Home  2 Dirs  3 Files  D Dupes  L All");
+            char title[320];
+            snprintf(title, sizeof(title), "%s%s%s", view_name(view),
+                     state->filter[0] ? " | Filter: " : "", state->filter);
+            attron(A_BOLD); draw_text(2, 0, cols, title); attroff(A_BOLD);
+            if (view == VIEW_DASHBOARD && rows >= 16 && cols >= 48 && !help) {
+                size_t folders = 0, files = 0;
+                for (size_t i = 0; i < current->child_count; ++i)
+                    if (current->children[i]->is_dir) ++folders; else ++files;
+                char size[32], reclaim[32], summary[192];
+                format_node_size(current, size, sizeof(size));
+                format_size(total_reclaimable, reclaim, sizeof(reclaim));
+                snprintf(summary, sizeof(summary), "Total: %s | Folders: %zu | Files here: %zu", size, folders, files);
+                draw_text(3, 0, cols, summary);
+                if (duplicates_checked)
+                    snprintf(summary, sizeof(summary), "Duplicate groups: %zu (scan-wide) | Reclaimable: %s", group_count, reclaim);
+                else snprintf(summary, sizeof(summary), "Duplicates: not checked | Press D to scan");
+                draw_text(4, 0, cols, summary);
+                draw_text(5, 0, cols, "FOLDERS - Enter opens the selected folder");
+                top = 6;
+            }
+            body_height = rows - top - 3;
+            cards = (view == VIEW_DASHBOARD || view == VIEW_FOLDERS) &&
+                    card_geometry(cols, body_height, &columns, &card_rows);
+            if (!cards) columns = 1;
+            page = cards ? (size_t)columns * card_rows : (size_t)body_height;
+            keep_visible(state, items.count, page, cards ? (size_t)columns : 1);
+            if (help) {
+                const char *lines[] = {
+                    "1 Dashboard   2 Folders   3 Files", "D Duplicates (scan-wide)   L All items",
+                    "Arrows move   PgUp/PgDn page", "Home/End first/last   Enter open/expand",
+                    "Backspace parent   Esc return from duplicates", "F filter   Ctrl-U clear filter   S sort",
+                    "[D!] marks an unreadable folder",
+                    "? or Esc close help   Q quit"
+                };
+                for (size_t i = 0; i < sizeof(lines) / sizeof(lines[0]) && (int)i < body_height; ++i)
+                    draw_text(top + (int)i, 0, cols, lines[i]);
+            } else if (!items.count) {
+                draw_text(top, 0, cols, state->filter[0] ? "No items match the current filter"
+                    : current->inaccessible && view != VIEW_DUPLICATES ? "Cannot read this directory"
+                    : view == VIEW_DUPLICATES ? "No duplicate files in the scanned tree"
+                    : view == VIEW_FILES ? "No files directly in this folder"
+                    : view == VIEW_ALL ? "This directory is empty"
+                    : "No folders here - press 3 to see files");
+            } else {
+                size_t shown = items.count - state->first;
+                if (shown > page) shown = page;
+                for (size_t offset = 0; offset < shown; ++offset) {
+                    size_t index = state->first + offset;
+                    ViewRow item = items.items[index];
+                    int selected = index == state->selected;
+                    if (cards) {
+                        draw_card(item.node, (int)(offset % (size_t)columns) * (CARD_WIDTH + 2),
+                                  top + (int)(offset / (size_t)columns) * (CARD_HEIGHT + 1), selected);
+                    } else {
+                        char size[32], line[PATH_MAX * 4 + 256];
+                        format_node_size(item.node, size, sizeof(size));
+                        if (view == VIEW_DUPLICATES && item.heading) {
+                            char reclaim[32]; format_size(reclaimable[item.group], reclaim, sizeof(reclaim));
+                            snprintf(line, sizeof(line), "%c [%c] Group %zu | %zu files | %s each | %s reclaimable",
+                                     selected ? '>' : ' ', item.group == expanded ? '-' : '+', item.group + 1,
+                                     groups[item.group].count, size, reclaim);
+                        } else if (view == VIEW_DUPLICATES)
+                            snprintf(line, sizeof(line), "%c   %s", selected ? '>' : ' ', item.node->path);
+                        else {
+                            char modified[32] = "";
+                            struct tm *date = localtime(&item.node->modified);
+                            if (date) strftime(modified, sizeof(modified), "%Y-%m-%d", date);
+                            char safe_name[PATH_MAX * 4], short_name[PATH_MAX * 4];
+                            safe_terminal_text(item.node->name, safe_name, sizeof(safe_name));
+                            const char *kind = item.node->inaccessible ? "D!" : item.node->is_dir ? "D" : "F";
+                            int name_width = cols - 5 - (int)strlen(kind);
+                            if (cols >= 40) name_width -= (int)strlen(size) + 3;
+                            if (cols >= 76) name_width -= (int)strlen(modified) + 3;
+                            clip_text(safe_name, name_width, short_name, sizeof(short_name));
+                            snprintf(line, sizeof(line), "%c [%s] %s%s%s%s%s", selected ? '>' : ' ',
+                                     kind, short_name,
+                                     cols >= 40 ? " | " : "", cols >= 40 ? size : "",
+                                     cols >= 76 ? " | " : "", cols >= 76 ? modified : "");
+                        }
+                        if (selected) attron(A_REVERSE | A_BOLD);
+                        draw_text(top + (int)offset, 0, cols, line);
+                        if (selected) attroff(A_REVERSE | A_BOLD);
+                    }
+                }
+            }
+            char range[160];
+            size_t end = items.count - state->first;
+            if (end > page) end = page;
+            snprintf(range, sizeof(range), "%s %zu-%zu of %zu%s | Sort: %s", view_name(view),
+                     items.count ? state->first + 1 : 0, state->first + end, items.count,
+                     state->first + end < items.count ? " | More below" : "", sort_name());
+            draw_text(rows - 3, 0, cols, range);
+            if (editing) {
+                char prompt[320]; snprintf(prompt, sizeof(prompt), "Filter: %s | Enter apply, Esc cancel", state->filter);
+                draw_text(rows - 2, 0, cols, prompt);
+                int cursor = 8 + text_width(state->filter);
+                if (cursor >= cols) cursor = cols - 1;
+                move(rows - 2, cursor);
+            } else if (help) draw_text(rows - 2, 0, cols, "Help is open | ? or Esc closes");
+            else if (items.count) {
+                ViewRow item = items.items[state->selected];
+                if (view == VIEW_DUPLICATES && item.heading)
+                    draw_text(rows - 2, 0, cols, "Enter expands/collapses this group | Esc returns");
+                else {
+                    char safe[PATH_MAX * 4], tail[PATH_MAX * 4];
+                    safe_terminal_text(item.node->path, safe, sizeof(safe));
+                    int prefix = item.node->inaccessible ? 13 : 0;
+                    clip_tail(safe, cols - prefix, tail, sizeof(tail));
+                    if (prefix) draw_text(rows - 2, 0, prefix, "Cannot read: ");
+                    draw_text(rows - 2, prefix, cols - prefix, tail);
+                }
+            }
+            draw_text(rows - 1, 0, cols, keyboard_hint(cols));
+            if (editing) {
+                int cursor = 8 + text_width(state->filter);
+                move(rows - 2, cursor < cols ? cursor : cols - 1);
+            }
+        }
+        refresh();
+        int key = getch();
+        if (key == KEY_RESIZE || key == ERR) continue;
+        if (editing) {
+            if (key == '\n' || key == KEY_ENTER || key == 27) {
+                if (key == 27) *state = before_edit;
+                editing = 0; curs_set(0);
+            } else {
+                size_t length = strlen(state->filter);
+                if (key == KEY_BACKSPACE || key == 127 || key == 8) filter_backspace(state->filter);
+                else if (key == 21) state->filter[0] = '\0';
+                else if (key >= 32 && key <= 255 && length + 1 < sizeof(state->filter)) {
+                    state->filter[length] = (char)key; state->filter[length + 1] = '\0';
+                }
+            }
+            if (editing) state->selected = state->first = 0;
+            continue;
+        }
+        if (key == 'q' || key == 'Q') break;
+        if (key == '?' || (help && key == 27)) { help = !help; continue; }
+        if (help) continue;
+        if (key == '1') view = VIEW_DASHBOARD;
+        else if (key == '2') view = VIEW_FOLDERS;
+        else if (key == '3') view = VIEW_FILES;
+        else if (key == 'l' || key == 'L') view = VIEW_ALL;
+        else if (key == 'd' || key == 'D') {
+            if (view != VIEW_DUPLICATES) { previous_view = view; view = VIEW_DUPLICATES; }
+        } else if (key == 27 && view == VIEW_DUPLICATES) view = previous_view;
+        else if (key == 'f' || key == 'F') {
+            before_edit = *state;
+            editing = 1; curs_set(1);
+        } else if ((key == 's' || key == 'S') && view != VIEW_DUPLICATES) {
+            sort_mode = (sort_mode + 1) % 3;
+            sort_view_states(current, states);
+        } else if ((key == KEY_BACKSPACE || key == 127 || key == 8) && view != VIEW_DUPLICATES && current->parent) {
+            anchor = (ViewRow){current, SIZE_MAX, 0}; have_anchor = 1;
+            current = current->parent;
+            memset(states, 0, sizeof(states));
+            sort_children(current);
+        } else if (items.count) {
+            ViewRow item = items.items[state->selected];
+            size_t step = 0;
+            int backward = 0;
+            if (key == KEY_HOME) state->selected = 0;
+            else if (key == KEY_END) state->selected = items.count - 1;
+            else if (key == KEY_PPAGE) { step = page; backward = 1; }
+            else if (key == KEY_NPAGE) step = page;
+            else if (key == KEY_UP) { step = cards ? (size_t)columns : 1; backward = 1; }
+            else if (key == KEY_DOWN) step = cards ? (size_t)columns : 1;
+            else if (key == KEY_LEFT) { step = 1; backward = 1; }
+            else if (key == KEY_RIGHT) step = 1;
+            else if (key == '\n' || key == KEY_ENTER) {
+                if (view == VIEW_DUPLICATES) {
+                    expanded = expanded == item.group ? SIZE_MAX : item.group;
+                    anchor = (ViewRow){groups[item.group].files[0], item.group, 1}; have_anchor = 1;
+                } else if (item.node->is_dir && !item.node->inaccessible) {
+                    current = item.node;
+                    sort_children(current);
+                    memset(states, 0, sizeof(states));
+                }
+            }
+            if (step) {
+                if (backward) state->selected = state->selected < step ? 0 : state->selected - step;
+                else {
+                    size_t remaining = items.count - 1 - state->selected;
+                    state->selected += step < remaining ? step : remaining;
+                }
+            }
         }
     }
-    return selected;
-}
-
-/* Select the first or last child matching the active filter. */
-static size_t list_edge_selection(Node *parent, int last, const char *query) {
-    if (!parent->child_count) return 0;
-    if (last) {
-        for (size_t i = parent->child_count; i > 0; --i)
-            if (name_matches(parent->children[i - 1]->name, query)) return i - 1;
-    } else {
-        for (size_t i = 0; i < parent->child_count; ++i)
-            if (name_matches(parent->children[i]->name, query)) return i;
-    }
-    return 0;
-}
-
-/* Advance the list viewport by matching entries for page navigation. */
-static size_t advance_list_index(Node *parent, size_t index, int direction,
-                                 size_t steps, const char *query) {
-    if (!parent->child_count) return 0;
-    for (size_t step = 0; step < steps; ++step) {
-        int found = 0;
-        if (direction > 0) {
-            for (size_t i = index + 1; i < parent->child_count; ++i) {
-                if (!name_matches(parent->children[i]->name, query)) continue;
-                index = i; found = 1; break;
-            }
-        } else {
-            for (size_t i = index; i > 0; --i) {
-                if (!name_matches(parent->children[i - 1]->name, query)) continue;
-                index = i - 1; found = 1; break;
-            }
-        }
-        if (!found) break;
-    }
-    return index;
-}
-
-/* Count matches for the list heading and selected-item status. */
-static size_t matching_count(Node *parent, const char *query) {
-    size_t count = 0;
-    for (size_t i = 0; i < parent->child_count; ++i)
-        if (name_matches(parent->children[i]->name, query)) ++count;
-    return count;
+    free(items.items); free(reclaimable);
+    free_duplicate_groups(groups, group_count);
+    endwin(); ui_active = 0;
+    save_state(current->path, sort_mode, 0, 0);
+    return EXIT_SUCCESS;
 }
 
 int main(int argc, char **argv) {
-    /* Enable locale-aware character decoding before terminal initialization. */
     setlocale(LC_CTYPE, "");
     if (argc > 1 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
         printf("Usage: dupmap [options] [path]\n\n"
@@ -1068,24 +1118,22 @@ int main(int argc, char **argv) {
                "  --dupes [path]  report duplicate files and reclaimable space\n"
                "  -h, --help      show this help\n"
                "  -v, --version   show version\n\n"
-               "Interactive keys: arrows select, Enter opens, Backspace goes up,\n"
-               "l toggles the complete list view, f filters names, s cycles sorting,\n"
-               "c cycles colors, ? shows keyboard help, q quits.\n");
+               "Interactive: 1 dashboard, 2 folders, 3 files, d duplicates, l all items.\n"
+               "Arrows select, Enter opens/expands, Backspace goes up, Esc returns.\n"
+               "f filters names, s cycles sorting, ? shows keyboard help, q quits.\n");
         return EXIT_SUCCESS;
     }
     if (argc > 1 && (!strcmp(argv[1], "--version") || !strcmp(argv[1], "-v"))) {
-        puts("dupmap " DUPMAP_VERSION);
-        return EXIT_SUCCESS;
+        puts("dupmap " DUPMAP_VERSION); return EXIT_SUCCESS;
     }
-    /* Resolve the scan root from CLI arguments, saved state, or current folder. */
     int dupes_mode = argc > 1 && !strcmp(argv[1], "--dupes");
-    char cwd[PATH_MAX], saved_path[PATH_MAX]; int saved_list_mode = 0;
+    char cwd[PATH_MAX], saved_path[PATH_MAX];
+    int legacy_color = 0, legacy_list = 0;
     const char *root_path;
     if (dupes_mode) root_path = argc > 2 ? argv[2] : ".";
     else if (argc > 1) root_path = argv[1];
-    else if (load_state(saved_path, sizeof(saved_path), &sort_mode, &color_mode, &saved_list_mode)) root_path = saved_path;
+    else if (load_state(saved_path, sizeof(saved_path), &sort_mode, &legacy_color, &legacy_list)) root_path = saved_path;
     else root_path = getcwd(cwd, sizeof(cwd)) ? cwd : ".";
-    /* Reject a symlink root explicitly; descendants are checked during scanning. */
     char root_check[PATH_MAX];
     size_t root_length = strlen(root_path);
     if (root_length < sizeof(root_check)) {
@@ -1093,289 +1141,47 @@ int main(int argc, char **argv) {
         while (root_length > 1 && root_check[root_length - 1] == '/') root_check[--root_length] = '\0';
         struct stat root_stat;
         if (lstat(root_check, &root_stat) == 0 && S_ISLNK(root_stat.st_mode)) {
-            char visible_path[PATH_MAX];
-            safe_terminal_text(root_path, visible_path, sizeof(visible_path));
+            char visible_path[PATH_MAX]; safe_terminal_text(root_path, visible_path, sizeof(visible_path));
             fprintf(stderr, "dupmap: cannot read '%s': symbolic links are skipped\n", visible_path);
             return EXIT_FAILURE;
         }
     }
     char resolved[PATH_MAX]; if (realpath(root_path, resolved)) root_path = resolved;
-    /* Initialize curses only for interactive mode; reports remain plain text. */
     if (!dupes_mode) {
         if (!initscr()) { fprintf(stderr, "dupmap: cannot initialize terminal UI\n"); return EXIT_FAILURE; }
         ui_active = 1; cbreak(); noecho(); keypad(stdscr, TRUE); curs_set(0);
-        ui_color_enabled = has_colors() && start_color() != ERR && COLOR_PAIRS > 9;
-        if (ui_color_enabled) {
-            int color_setup_ok = 1;
-            for (int i = 1; i <= 6; ++i) {
-                short foreground = (i == COLOR_YELLOW || i == COLOR_CYAN) ? COLOR_BLACK : COLOR_WHITE;
-                if (init_pair(i, foreground, (short)i) == ERR) color_setup_ok = 0;
-            }
-            if (init_pair(7, COLOR_WHITE, COLOR_RED) == ERR ||
-                init_pair(8, COLOR_BLACK, COLOR_WHITE) == ERR ||
-                init_pair(9, COLOR_BLACK, COLOR_CYAN) == ERR) color_setup_ok = 0;
-            ui_color_enabled = color_setup_ok;
-        }
-        ui_work_count = 0;
-        show_progress("Scanning", root_path);
+        timeout(-1);
+        begin_progress("Scanning folders", root_path);
     }
-    /* Build the in-memory snapshot shared by reporting and interactive views. */
     Node *root = scan_path(root_path, root_path, 1);
     if (!root) {
+        int scan_errno = errno;
         if (ui_active) { endwin(); ui_active = 0; }
-        char visible_path[PATH_MAX];
-        safe_terminal_text(root_path, visible_path, sizeof(visible_path));
-        fprintf(stderr, "dupmap: cannot read '%s': %s\n", visible_path, strerror(errno));
+        char visible_path[PATH_MAX]; safe_terminal_text(root_path, visible_path, sizeof(visible_path));
+        fprintf(stderr, "dupmap: cannot read '%s': %s\n", visible_path, strerror(scan_errno));
         return EXIT_FAILURE;
     }
     if (!dupes_mode && !root->is_dir) {
         endwin(); ui_active = 0; free_node(root);
-        char visible_path[PATH_MAX];
-        safe_terminal_text(root_path, visible_path, sizeof(visible_path));
-        fprintf(stderr, "dupmap: '%s' is not a directory\n", visible_path);
-        return EXIT_FAILURE;
+        char visible_path[PATH_MAX]; safe_terminal_text(root_path, visible_path, sizeof(visible_path));
+        fprintf(stderr, "dupmap: '%s' is not a directory\n", visible_path); return EXIT_FAILURE;
     }
-    /* Noninteractive mode prints exact-match groups and reclaimable byte totals. */
+    int result = EXIT_SUCCESS;
     if (dupes_mode) {
-        DuplicateGroup *groups = NULL; size_t group_count = find_duplicate_groups(root, &groups);
+        DuplicateGroup *groups = NULL;
+        size_t group_count = find_duplicate_groups(root, &groups);
         printf("Duplicate groups: %zu\n", group_count);
         for (size_t i = 0; i < group_count; ++i) {
-            off_t reclaimable = duplicate_reclaimable_size(&groups[i]);
-            char size_text[32]; format_size(reclaimable, size_text, sizeof(size_text));
-            printf("\n%s reclaimable (%zu files):\n", size_text, groups[i].count);
+            char size[32]; format_size(duplicate_reclaimable_size(&groups[i]), size, sizeof(size));
+            printf("\n%s reclaimable (%zu files):\n", size, groups[i].count);
             for (size_t j = 0; j < groups[i].count; ++j) {
                 char visible_path[PATH_MAX];
                 safe_terminal_text(groups[i].files[j]->path, visible_path, sizeof(visible_path));
                 printf("  %s\n", visible_path);
             }
         }
-        free_duplicate_groups(groups, group_count); free_node(root); return EXIT_SUCCESS;
-    }
-
-    /* Mark duplicates once so every directory view can highlight their members. */
-    DuplicateGroup *duplicate_groups = NULL;
-    ui_work_count = 0;
-    show_progress("Checking duplicates", root_path);
-    size_t duplicate_group_count = find_duplicate_groups(root, &duplicate_groups);
-    Node *current = root; size_t selected = 0, list_first = 0;
-    int list_mode = saved_list_mode, list_first_valid = 0;
-    char filter[256] = "";
-    int pulse_frames = 0, help_mode = 0, list_page_rows = 1, force_tiles = 0;
-    BoxList boxes = {0};
-    Node *layout_parent = NULL;
-    int layout_cols = -1, layout_height = -1, layout_sort = -1;
-    /*
-     * Redraw from current state, then apply one keyboard action per iteration.
-     * Selection is retained as an index into current's sorted children, while
-     * the tile geometry is cached until folder, dimensions, or sort mode change.
-     */
-    for (;;) {
-        int rows, cols; getmaxyx(stdscr, rows, cols); erase();
-        if (rows < 6 || cols < 16) {
-            mvaddnstr(0, 0, "Terminal too small; resize to continue (q quits)", cols > 0 ? cols : 0);
-            refresh();
-            timeout(-1);
-            int key = getch();
-            if (key == 'q' || key == 'Q') break;
-            continue;
-        }
-        char size_text[32]; format_size(current->size, size_text, sizeof(size_text));
-        int size_width = cols >= 24 ? (int)strlen(size_text) + 2 : 0;
-        int path_width = cols - 8 - size_width;
-        if (path_width < 1) path_width = 1;
-        char short_path[PATH_MAX + 8];
-        char visible_path[PATH_MAX + 8];
-        safe_terminal_text(current->path, visible_path, sizeof(visible_path));
-        clip_tail(visible_path, path_width, short_path, sizeof(short_path));
-        char header[PATH_MAX + 32];
-        snprintf(header, sizeof(header), "dupmap  %s", short_path);
-        attron(A_BOLD);
-        mvaddnstr(0, 0, header, (int)strlen(header));
-        attroff(A_BOLD);
-        if (cols >= 24) mvprintw(0, cols - (int)strlen(size_text) - 2, "%s", size_text);
-        const char *help = keyboard_hint(cols);
-        mvaddnstr(1, 0, help, cols);
-        int view_y = 2;
-        int footer_rows = rows >= 10 ? 2 : 1;
-        int view_height = rows - view_y - footer_rows;
-        size_t visible_items = 0;
-        for (size_t i = 0; i < current->child_count; ++i)
-            if (current->children[i]->size > 0) ++visible_items;
-        size_t cell_capacity = (size_t)cols * (size_t)view_height;
-        /* Keep enough area for readable labels; otherwise prefer the list. */
-        /* Switch to names when tiles would average too few cells for legible labels. */
-        int crowded = visible_items > cell_capacity / 24;
-        int has_zero_size = visible_items < current->child_count;
-        int compact_terminal = cols < 48 || rows < 12;
-        int auto_list = compact_terminal || crowded || has_zero_size;
-        int can_force_tiles = crowded && !compact_terminal && !has_zero_size;
-        int show_list = list_mode || compact_terminal || has_zero_size || (crowded && !force_tiles);
-        if (!show_list && (layout_parent != current || layout_cols != cols || layout_height != view_height || layout_sort != sort_mode)) {
-            free(boxes.items);
-            boxes = (BoxList){0};
-            layout_children(current, 0, view_y, cols, view_height, &boxes);
-            layout_parent = current;
-            layout_cols = cols;
-            layout_height = view_height;
-            layout_sort = sort_mode;
-        }
-        Node *selected_node = NULL;
-        if (help_mode) {
-            const char *help_lines[] = {
-                "Arrows: move   PgUp/PgDn: page list", "Home/End: first/last  Enter: open",
-                "Backspace: parent  L: toggle list", "F: filter  S: sort",
-                ui_color_enabled ? "C: colors  ?: close help" : "?: close help",
-                "Q: quit"
-            };
-            int help_count = rows - footer_rows - 2;
-            if (help_count > (int)(sizeof(help_lines) / sizeof(help_lines[0]))) help_count = (int)(sizeof(help_lines) / sizeof(help_lines[0]));
-            for (int i = 0; i < help_count; ++i) mvaddnstr(2 + i, 0, help_lines[i], cols);
-        } else if (show_list) {
-            if (filter[0] && (!current->child_count || !name_matches(current->children[selected < current->child_count ? selected : 0]->name, filter))) selected = next_match(current, 0, 1, filter);
-            if (selected >= current->child_count && current->child_count) selected = current->child_count - 1;
-            int list_start = rows >= 10 ? 3 : view_y;
-            int list_rows = rows - footer_rows - list_start;
-            if (list_rows < 1) list_rows = 1;
-            list_page_rows = list_rows;
-            size_t total = filter[0] ? matching_count(current, filter) : current->child_count;
-            size_t first = list_first_valid ? list_first : list_window_start(current, selected, list_rows, filter);
-            if (first >= current->child_count) first = 0;
-            int selected_visible = 0;
-            size_t in_window = 0;
-            for (size_t i = first; i < current->child_count && in_window < (size_t)list_rows; ++i) {
-                if (!name_matches(current->children[i]->name, filter)) continue;
-                if (i == selected) selected_visible = 1;
-                ++in_window;
-            }
-            if (total && !selected_visible)
-                first = list_window_start(current, selected, list_rows, filter);
-            list_first = first;
-            list_first_valid = 1;
-            size_t first_position = 0;
-            for (size_t i = 0; i < first; ++i)
-                if (name_matches(current->children[i]->name, filter)) ++first_position;
-            if (rows >= 10) {
-                char heading[192];
-                const char *reason = auto_list && !list_mode
-                    ? (can_force_tiles ? " | crowded: l for tiles" :
-                       (has_zero_size ? " | zero-size items" : " | compact terminal")) : "";
-                size_t end_position = first_position;
-                if (total > first_position) {
-                    size_t remaining = total - first_position;
-                    end_position += remaining < (size_t)list_rows ? remaining : (size_t)list_rows;
-                }
-                if (total)
-                    snprintf(heading, sizeof(heading), "Contents %zu-%zu of %zu%s",
-                             first_position + 1, end_position, total, reason);
-                else snprintf(heading, sizeof(heading), "Contents 0 items%s", reason);
-                mvaddnstr(2, 0, heading, cols);
-            }
-            size_t shown = 0;
-            for (size_t i = first; i < current->child_count && shown < (size_t)list_rows; ++i) {
-                Node *item = current->children[i]; char item_size[32]; format_size(item->size, item_size, sizeof(item_size));
-                if (!name_matches(item->name, filter)) continue;
-                int line = list_start + (int)shown;
-                if (line >= rows - footer_rows) break;
-                char entry[PATH_MAX + 64];
-                char visible_name[PATH_MAX + 64];
-                safe_terminal_text(item->name, visible_name, sizeof(visible_name));
-                snprintf(entry, sizeof(entry), "%c %s%s  %s%s%s", i == selected ? '>' : ' ', item->is_dir ? "[D] " : "[F] ", visible_name,
-                         item_size, item->is_duplicate ? "  *" : "", item->inaccessible ? "  [permission denied]" : "");
-                if (ui_color_enabled && item->is_duplicate) attron(COLOR_PAIR(7));
-                if (i == selected) attron(A_REVERSE | A_BOLD);
-                else if (item->is_dir) attron(A_BOLD);
-                char clipped_entry[PATH_MAX + 64];
-                clip_text(entry, cols, clipped_entry, sizeof(clipped_entry));
-                mvaddnstr(line, 0, clipped_entry, (int)strlen(clipped_entry));
-                attroff(A_REVERSE | A_BOLD | (ui_color_enabled ? COLOR_PAIR(7) : 0));
-                ++shown;
-            }
-            if (current->child_count && (!filter[0] || name_matches(current->children[selected]->name, filter))) selected_node = current->children[selected];
-        } else {
-            if (selected >= boxes.count && boxes.count) selected = boxes.count - 1;
-            for (size_t i = 0; i < boxes.count; ++i) draw_box(&boxes.items[i], i == selected, 0, pulse_frames > 1);
-            if (boxes.count) selected_node = boxes.items[selected].node;
-        }
-        int status_y = rows - footer_rows;
-        if (help_mode) mvaddnstr(status_y, 0, "Help is open  |  ? or Esc closes", cols);
-        else if (selected_node) {
-            char selected_size[32], status[PATH_MAX + 96]; format_size(selected_node->size, selected_size, sizeof(selected_size));
-            char visible_name[PATH_MAX + 96];
-            safe_terminal_text(selected_node->name, visible_name, sizeof(visible_name));
-            size_t position = 0, total = 0;
-            for (size_t i = 0; i < current->child_count; ++i) {
-                if (!name_matches(current->children[i]->name, filter)) continue;
-                ++total;
-                if (i == selected) position = total;
-            }
-            snprintf(status, sizeof(status), "%s  |  %s  |  %zu/%zu%s%s", visible_name, selected_size, position, total,
-                     selected_node->inaccessible ? "  [permission denied]" : "",
-                     selected_node->is_duplicate ? "  [duplicate]" : "");
-            char clipped_status[PATH_MAX + 96];
-            clip_text(status, cols, clipped_status, sizeof(clipped_status));
-            mvaddnstr(status_y, 0, clipped_status, (int)strlen(clipped_status));
-        } else if (current->inaccessible) mvaddnstr(status_y, 0, "Cannot read this directory", cols);
-        else if (filter[0]) mvaddnstr(status_y, 0, "No items match the current filter", cols);
-        else if (current->child_count && !visible_items) mvaddnstr(status_y, 0, "Only zero-byte items; list view is enabled", cols);
-        else if (current->child_count) mvaddnstr(status_y, 0, "No visible items in this folder", cols);
-        else mvaddnstr(status_y, 0, "This directory is empty", cols);
-        if (footer_rows == 2) {
-            char footer[128];
-            if (help_mode) snprintf(footer, sizeof(footer), "Press ? or Esc to return  |  q quits");
-            else snprintf(footer, sizeof(footer), "Sort: %s | Color: %s | [D] folder  [F] file  %s duplicate", sort_name(), color_name(), ui_color_enabled ? "red=" : "*=");
-            mvaddnstr(rows - 1, 0, footer, cols);
-        }
-        refresh();
-        timeout(pulse_frames ? 70 : -1);
-        int key = getch();
-        if (key == ERR) { --pulse_frames; continue; }
-        size_t previous_selection = selected;
-        if (key == 'q' || key == 'Q') break;
-        if (key == '?' || (help_mode && key == 27)) help_mode = !help_mode;
-        else if (help_mode) { /* Keep help visible until ? or Escape. */ }
-        else if (key == 'l' || key == 'L') {
-            if (show_list && can_force_tiles) { list_mode = 0; force_tiles = 1; }
-            else if (show_list && list_mode) { list_mode = 0; force_tiles = 0; }
-            else if (!show_list) { list_mode = 1; force_tiles = 0; }
-        }
-        else if (key == 'f' || key == 'F') {
-            list_mode = 1; echo(); curs_set(1); mvprintw(rows - 1, 0, "Filter (empty clears): "); clrtoeol(); getnstr(filter, sizeof(filter) - 1); noecho(); curs_set(0); selected = 0; list_first_valid = 0;
-        }
-        else if (key == 's' || key == 'S') {
-            Node *anchor = selected_node;
-            sort_mode = (sort_mode + 1) % 3;
-            sort_children(current);
-            if (anchor) selected = child_index(current, anchor);
-            list_first_valid = 0;
-        }
-        else if (ui_color_enabled && (key == 'c' || key == 'C')) { color_mode = (color_mode + 1) % 3; }
-        else if (show_list && (key == KEY_LEFT || key == KEY_UP)) selected = move_list_selection(current, selected, -1, 1, filter);
-        else if (show_list && (key == KEY_RIGHT || key == KEY_DOWN)) selected = move_list_selection(current, selected, 1, 1, filter);
-        else if (show_list && key == KEY_PPAGE) {
-            selected = move_list_selection(current, selected, -1, (size_t)list_page_rows, filter);
-            list_first = advance_list_index(current, list_first, -1, (size_t)list_page_rows, filter);
-            list_first_valid = 1;
-        }
-        else if (show_list && key == KEY_NPAGE) {
-            selected = move_list_selection(current, selected, 1, (size_t)list_page_rows, filter);
-            list_first = advance_list_index(current, list_first, 1, (size_t)list_page_rows, filter);
-            list_first_valid = 1;
-        }
-        else if (show_list && key == KEY_HOME) selected = list_edge_selection(current, 0, filter);
-        else if (show_list && key == KEY_END) selected = list_edge_selection(current, 1, filter);
-        else if ((key == '\n' || key == KEY_ENTER) && selected_node && selected_node->is_dir && !selected_node->inaccessible) { current = selected_node; sort_children(current); selected = 0; filter[0] = '\0'; list_first_valid = 0; force_tiles = 0; }
-        else if (!show_list && (key == KEY_LEFT || key == KEY_UP)) { if (selected) --selected; }
-        else if (!show_list && (key == KEY_RIGHT || key == KEY_DOWN)) { if (selected + 1 < boxes.count) ++selected; }
-        else if ((key == KEY_BACKSPACE || key == 127 || key == 8) && current != root) {
-            Node *child = current;
-            current = current->parent;
-            selected = child_index(current, child);
-            filter[0] = '\0';
-            list_first_valid = 0;
-            force_tiles = 0;
-        }
-        pulse_frames = (!show_list && selected != previous_selection) ? 4 : 0;
-    }
-    free(boxes.items);
-    endwin(); ui_active = 0; save_state(root->path, sort_mode, color_mode, list_mode); free_duplicate_groups(duplicate_groups, duplicate_group_count); free_node(root); return EXIT_SUCCESS;
+        free_duplicate_groups(groups, group_count);
+    } else result = run_dashboard(root);
+    free_node(root);
+    return result;
 }

@@ -90,11 +90,9 @@ int main(void) {
         if (groups[i].size == 5000) found_large = 1;
     }
     assert(found_tiny && found_large);
-    Node *other = child_named(root, "other");
-    assert(other && other->is_dir);
-    assert(child_named(other, "a.txt") && child_named(other, "a.txt")->is_duplicate);
-    assert(child_named(other, "b.txt") && child_named(other, "b.txt")->is_duplicate);
-    assert(child_named(other, "different.txt") && !child_named(other, "different.txt")->is_duplicate);
+    assert(child_named(root, "a.txt") && child_named(root, "a.txt")->is_duplicate);
+    assert(child_named(root, "b.txt") && child_named(root, "b.txt")->is_duplicate);
+    assert(child_named(root, "different.txt") && !child_named(root, "different.txt")->is_duplicate);
     free_duplicate_groups(groups, count); free_node(root);
     unlink(a); unlink(b); unlink(different); unlink(large_a); unlink(large_b); rmdir(root_path);
     puts("duplicate tests: all passed"); return 0;

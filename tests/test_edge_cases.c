@@ -1,5 +1,5 @@
 /* Regression cases for filesystem names, arithmetic limits, filtering, and
-   tile layouts at the edges of the supported viewport. */
+   real entries and dashboard view membership. */
 #define main dupmap_program_main
 #include "../src/main.c"
 #undef main
@@ -20,7 +20,7 @@ static Node *find_child(Node *parent, const char *name) {
     return NULL;
 }
 
-static void test_tiny_group_name_does_not_shadow_existing_entry(int with_tiny_file) {
+static void test_real_other_entry_and_small_files(int with_tiny_file) {
     char path[] = "/tmp/dupmap-names-XXXXXX";
     assert(mkdtemp(path));
     char entry[PATH_MAX];
@@ -40,12 +40,11 @@ static void test_tiny_group_name_does_not_shadow_existing_entry(int with_tiny_fi
     assert(find_child(root, "other"));
     assert(!find_child(root, "other")->is_dir);
     assert(find_child(root, "other")->size == 3);
-    Node *group = find_child(root, "other (3)");
+    assert(!find_child(root, "other (3)"));
     if (with_tiny_file) {
-        assert(group && group->is_dir && group->size == 7);
-        assert(group->file_count == 1);
-        assert(find_child(group, "tiny.txt"));
-    } else assert(!group);
+        Node *tiny = find_child(root, "tiny.txt");
+        assert(tiny && !tiny->is_dir && tiny->size == 7 && tiny->parent == root);
+    }
     assert(root->size == 5003 + (with_tiny_file ? 7 : 0));
     assert(root->file_count == (size_t)(2 + with_tiny_file));
     free_node(root);
@@ -89,41 +88,39 @@ static void test_aggregate_counters_saturate(void) {
     free_node(parent);
 }
 
-static void test_filter_matching_and_wraparound(void) {
+static void test_views_filters_and_duplicate_rows(void) {
     Node *parent = new_node("parent", "/parent", 1);
-    add_child(parent, new_node("Alpha.txt", "/parent/Alpha.txt", 0));
-    add_child(parent, new_node("beta.txt", "/parent/beta.txt", 0));
-    add_child(parent, new_node("middle-one", "/parent/middle-one", 0));
-    add_child(parent, new_node("middle-two", "/parent/middle-two", 0));
-    add_child(parent, new_node("alphabet.bin", "/parent/alphabet.bin", 0));
+    Node *folder = new_node("empty-folder", "/parent/empty-folder", 1);
+    Node *a = new_node("Alpha.txt", "/parent/Alpha.txt", 0);
+    Node *b = new_node("alphabet.bin", "/parent/alphabet.bin", 0);
+    add_child(parent, folder); add_child(parent, a); add_child(parent, b);
     assert(name_matches("Alpha.txt", "ALP"));
     assert(!name_matches("beta.txt", "ALP"));
-    assert(next_match(parent, 0, 1, "alp") == 4);
-    assert(next_match(parent, 4, 1, "alp") == 0);
-    assert(next_match(parent, 0, -1, "alp") == 4);
-    assert(name_matches("anything", ""));
-    assert(matching_count(parent, "alp") == 2);
-    assert(list_window_start(parent, 4, 2, "alp") == 0);
-    assert(list_window_start(parent, 4, 1, "alp") == 4);
-    free_node(parent);
-}
-
-static void test_tile_pulse_never_underlines_tile_fill(void) {
-    assert(!(tile_selection_attrs(1, 1, 1) & A_UNDERLINE));
-    assert(!(tile_selection_attrs(1, 0, 1) & A_UNDERLINE));
-    assert(tile_selection_attrs(1, 0, 0) & A_REVERSE);
-    assert(tile_color_pair(1, 1, 3) == 9);
-    assert(tile_color_pair(1, 0, 3) == 8);
-    assert(tile_color_pair(0, 1, 3) == 3);
-}
-
-static void test_monochrome_controls_are_not_advertised(void) {
-    ui_color_enabled = 0;
-    assert(!strstr(keyboard_hint(80), "color"));
-    assert(!strcmp(color_name(), "mono"));
-    ui_color_enabled = 1;
-    assert(strstr(keyboard_hint(120), "c:color"));
-    ui_color_enabled = 0;
+    ViewRows rows = {0};
+    for (enum View view = VIEW_DASHBOARD; view < VIEW_COUNT; ++view) {
+        if (view == VIEW_DUPLICATES) continue;
+        build_view_rows(parent, view, "", NULL, 0, SIZE_MAX, &rows);
+        assert(rows.count == (view == VIEW_FILES ? 2 : view == VIEW_ALL ? 3 : 1));
+        if (view == VIEW_DASHBOARD || view == VIEW_FOLDERS) assert(rows.items[0].node == folder);
+    }
+    build_view_rows(parent, VIEW_FILES, "ALP", NULL, 0, SIZE_MAX, &rows);
+    assert(rows.count == 2 && rows.items[0].node == a);
+    build_view_rows(parent, VIEW_ALL, "missing", NULL, 0, SIZE_MAX, &rows);
+    assert(rows.count == 0);
+    Node *files[] = {a, b};
+    DuplicateGroup group = {files, 2, 0};
+    build_view_rows(parent, VIEW_DUPLICATES, "", &group, 1, SIZE_MAX, &rows);
+    assert(rows.count == 1 && rows.items[0].heading);
+    build_view_rows(parent, VIEW_DUPLICATES, "Alpha.txt", &group, 1, 0, &rows);
+    assert(rows.count == 3 && rows.items[0].heading && !rows.items[1].heading);
+    assert(rows.items[1].node == a && rows.items[2].node == b);
+    build_view_rows(parent, VIEW_DUPLICATES, "missing", &group, 1, 0, &rows);
+    assert(rows.count == 0);
+    char filter[] = "caf\xC3\xA9";
+    filter_backspace(filter);
+    assert(!strcmp(filter, "caf"));
+    assert(!strstr(keyboard_hint(120), "color"));
+    free(rows.items); free_node(parent);
 }
 
 static void test_sorting_uses_current_mode(void) {
@@ -138,11 +135,11 @@ static void test_sorting_uses_current_mode(void) {
     sort_mode = 1;
     sort_children(parent);
     assert(parent->children[0] == alpha);
-    assert(child_index(parent, zulu) == 1);
+    assert(parent->children[1] == zulu);
     sort_mode = 2;
     sort_children(parent);
     assert(parent->children[0] == zulu);
-    assert(child_index(parent, zulu) == 0);
+    assert(parent->children[1] == alpha);
     sort_mode = old_sort;
     free_node(parent);
 }
@@ -155,84 +152,16 @@ static void test_text_clipping_preserves_utf8_sequences(void) {
     assert(!strcmp(clipped, "...ument.txt"));
     clip_text("short", 12, clipped, sizeof(clipped));
     assert(!strcmp(clipped, "short"));
+    char small[5];
+    clip_text("caf\xC3\xA9", 10, small, sizeof(small));
+    assert(!strcmp(small, "caf"));
+    clip_tail("caf\xC3\xA9", 10, small, sizeof(small));
+    assert(!strcmp(small, "caf"));
+    clip_text("name", 0, small, sizeof(small));
+    assert(!small[0]);
 }
 
-static void test_large_tile_sets_remain_inside_view(void) {
-    Node *parent = new_node("parent", "/parent", 1);
-    for (size_t i = 0; i < 300; ++i) {
-        char name[32];
-        snprintf(name, sizeof(name), "item-%zu", i);
-        Node *child = new_node(name, name, 0);
-        child->size = (off_t)(i + 1);
-        add_child(parent, child);
-    }
-    qsort(parent->children, parent->child_count, sizeof(*parent->children), compare_nodes);
-    BoxList boxes = {0};
-    layout_children(parent, 4, 3, 40, 16, &boxes);
-    assert(boxes.count == parent->child_count);
-    for (size_t i = 0; i < boxes.count; ++i) {
-        Box a = boxes.items[i];
-        assert(a.w > 0 && a.h > 0);
-        assert(a.x >= 4 && a.y >= 3);
-        assert(a.x + a.w <= 44 && a.y + a.h <= 19);
-        for (size_t j = i + 1; j < boxes.count; ++j) {
-            Box b = boxes.items[j];
-            assert(a.node != b.node);
-            assert(!(a.x < b.x + b.w && a.x + a.w > b.x &&
-                     a.y < b.y + b.h && a.y + a.h > b.y));
-        }
-    }
-    free(boxes.items);
-    free_node(parent);
-}
-
-static void test_tiny_viewports_and_zero_sized_children(void) {
-    Node *parent = new_node("parent", "/parent", 1);
-    Node *one = new_node("one", "/parent/one", 0);
-    Node *two = new_node("two", "/parent/two", 0);
-    Node *zero = new_node("zero", "/parent/zero", 0);
-    one->size = 10;
-    two->size = 20;
-    add_child(parent, one);
-    add_child(parent, two);
-    add_child(parent, zero);
-    BoxList boxes = {0};
-    layout_children(parent, 1, 1, 1, 1, &boxes);
-    assert(boxes.count <= 1);
-    for (size_t i = 0; i < boxes.count; ++i) {
-        assert(boxes.items[i].w == 1 && boxes.items[i].h == 1);
-        assert(boxes.items[i].node->size > 0);
-    }
-    free(boxes.items);
-    free_node(parent);
-}
-
-static void test_layout_dimension_sweep_and_large_units(void) {
-    Node *parent = new_node("parent", "/parent", 1);
-    for (size_t i = 0; i < 12; ++i) {
-        char name[32];
-        snprintf(name, sizeof(name), "item-%zu", i);
-        Node *child = new_node(name, name, 0);
-        child->size = (off_t)(i + 1);
-        add_child(parent, child);
-    }
-    for (int width = 1; width <= 40; width += 3) {
-        for (int height = 1; height <= 16; height += 3) {
-            BoxList boxes = {0};
-            layout_children(parent, 2, 3, width, height, &boxes);
-            for (size_t i = 0; i < boxes.count; ++i) {
-                Box a = boxes.items[i];
-                assert(a.x >= 2 && a.y >= 3);
-                assert(a.x + a.w <= 2 + width && a.y + a.h <= 3 + height);
-                for (size_t j = i + 1; j < boxes.count; ++j) {
-                    Box b = boxes.items[j];
-                    assert(!(a.x < b.x + b.w && a.x + a.w > b.x &&
-                             a.y < b.y + b.h && a.y + a.h > b.y));
-                }
-            }
-            free(boxes.items);
-        }
-    }
+static void test_large_units(void) {
     char size[32];
     uintmax_t petabyte = UINTMAX_C(1) << 50;
     uintmax_t exabyte = UINTMAX_C(1) << 60;
@@ -244,22 +173,17 @@ static void test_layout_dimension_sweep_and_large_units(void) {
         format_size((off_t)exabyte, size, sizeof(size));
         assert(!strcmp(size, "1.0 E"));
     }
-    free_node(parent);
 }
 
 int main(void) {
-    test_tiny_group_name_does_not_shadow_existing_entry(0);
-    test_tiny_group_name_does_not_shadow_existing_entry(1);
+    test_real_other_entry_and_small_files(0);
+    test_real_other_entry_and_small_files(1);
     test_root_symlink_is_not_scanned();
     test_aggregate_counters_saturate();
-    test_filter_matching_and_wraparound();
-    test_tile_pulse_never_underlines_tile_fill();
-    test_monochrome_controls_are_not_advertised();
+    test_views_filters_and_duplicate_rows();
     test_sorting_uses_current_mode();
     test_text_clipping_preserves_utf8_sequences();
-    test_large_tile_sets_remain_inside_view();
-    test_tiny_viewports_and_zero_sized_children();
-    test_layout_dimension_sweep_and_large_units();
+    test_large_units();
     puts("edge case tests: all passed");
     return 0;
 }

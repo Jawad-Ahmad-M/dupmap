@@ -1,6 +1,4 @@
-/* Include the implementation so the V1 core can be tested without starting
-   ncurses. This is intentionally temporary test architecture for V1; the
-   scanner/layout code can be split into a library when the UI grows. */
+/* Exercise scanner and formatting helpers without starting ncurses. */
 #define main dupmap_program_main
 #include "../src/main.c"
 #undef main
@@ -26,7 +24,7 @@ static Node *child_named(Node *parent, const char *name) {
     return NULL;
 }
 
-static void test_scan_aggregates_and_groups(void) {
+static void test_scan_aggregates_and_direct_entries(void) {
     char root_path[] = "/tmp/dupmap-test-XXXXXX";
     assert(mkdtemp(root_path));
     char path[PATH_MAX];
@@ -54,11 +52,9 @@ static void test_scan_aggregates_and_groups(void) {
     assert(child_named(root, "nested"));
     assert(child_named(root, "empty"));
     assert(child_named(root, "link-to-large") == NULL);
-    Node *other = child_named(root, "other");
-    assert(other && other->is_dir && other->size == 3);
-    assert(other->file_count == 1);
-    assert(child_named(other, "tiny.txt"));
-    assert(child_named(other, "tiny.txt")->parent == other);
+    assert(!child_named(root, "other"));
+    Node *tiny = child_named(root, "tiny.txt");
+    assert(tiny && tiny->size == 3 && tiny->parent == root);
     Node *nested = child_named(root, "nested");
     assert(nested->size == 6000);
     assert(child_named(nested, "data.bin"));
@@ -75,37 +71,56 @@ static void test_scan_aggregates_and_groups(void) {
     rmdir(root_path);
 }
 
-static void test_layout_stays_inside_view(void) {
-    char root_path[] = "/tmp/dupmap-layout-XXXXXX";
-    assert(mkdtemp(root_path));
-    char path[PATH_MAX];
-    for (int i = 0; i < 8; ++i) {
-        snprintf(path, sizeof(path), "%s/file-%d.bin", root_path, i);
-        write_bytes(path, (size_t)(5000 + i * 1000), (unsigned char)i);
-    }
-    Node *root = scan_path(root_path, root_path, 1);
-    assert(root);
-    BoxList boxes = {0};
-    const int x = 2, y = 3, width = 80, height = 24;
-    layout_children(root, x, y, width, height, &boxes);
-    assert(boxes.count == root->child_count);
-    for (size_t i = 0; i < boxes.count; ++i) {
-        Box a = boxes.items[i];
-        assert(a.x >= x && a.y >= y);
-        assert(a.x + a.w <= x + width && a.y + a.h <= y + height);
-        assert(a.w > 0 && a.h > 0);
-        assert(a.percent >= 0.0 && a.percent <= 100.0);
-        for (size_t j = i + 1; j < boxes.count; ++j) {
-            Box b = boxes.items[j];
-            int overlap = a.x < b.x + b.w && a.x + a.w > b.x &&
-                          a.y < b.y + b.h && a.y + a.h > b.y;
-            assert(!overlap);
-        }
-    }
-    free(boxes.items);
+static void test_lazy_directories(void) {
+    char path[] = "/tmp/dupmap-lazy-XXXXXX";
+    assert(mkdtemp(path));
+    char *nested_path = join_path(path, "nested");
+    char *empty_path = join_path(path, "empty");
+    make_dir(nested_path); make_dir(empty_path);
+    char *file_path = join_path(nested_path, "payload");
+    write_bytes(file_path, 7, 'x');
+    ui_work_count = 0;
+    Node *root = scan_path(path, path, 0);
+    assert(root && root->children_loaded && !root->size_known);
+    assert(ui_work_count == 3); /* Root and two immediate entries only. */
+    Node *nested = child_named(root, "nested"), *empty = child_named(root, "empty");
+    assert(nested && !nested->children_loaded && !nested->child_count);
+    char size[32];
+    format_node_size(nested, size, sizeof(size)); assert(!strcmp(size, "not calculated"));
+    char *late_path = join_path(nested_path, "late");
+    write_bytes(late_path, 3, 'y');
+    load_children(nested);
+    assert(nested->size_known && nested->size == 10 && nested->file_count == 2);
+    Node *payload = child_named(nested, "payload");
+    size_t scanned = ui_work_count;
+    load_children(nested);
+    assert(ui_work_count == scanned && child_named(nested, "payload") == payload);
+    assert(nested->child_count == 2);
+    update_totals(root); assert(!root->size_known && root->size == 10);
+    load_tree(root);
+    assert(empty->children_loaded && empty->size_known && !empty->size);
+    assert(root->size_known && root->size == 10 && root->file_count == 2);
+    scanned = ui_work_count;
+    load_tree(root);
+    assert(ui_work_count == scanned && root->size == 10 && root->file_count == 2);
     free_node(root);
-    for (int i = 0; i < 8; ++i) { snprintf(path, sizeof(path), "%s/file-%d.bin", root_path, i); unlink(path); }
-    rmdir(root_path);
+    unlink(file_path); unlink(late_path); rmdir(nested_path); rmdir(empty_path); rmdir(path);
+    free(file_path); free(late_path); free(nested_path); free(empty_path);
+}
+
+static void test_replaced_lazy_directory(void) {
+    char path[] = "/tmp/dupmap-replace-XXXXXX";
+    assert(mkdtemp(path));
+    char *original = join_path(path, "folder"), *moved = join_path(path, "moved");
+    make_dir(original);
+    Node *root = scan_path(path, path, 0), *folder = child_named(root, "folder");
+    assert(rename(original, moved) == 0);
+    make_dir(original);
+    load_children(folder);
+    assert(folder->inaccessible && folder->children_loaded && !folder->size_known);
+    assert(!folder->child_count);
+    free_node(root); rmdir(original); rmdir(moved); rmdir(path);
+    free(original); free(moved);
 }
 
 static void test_formatting(void) {
@@ -116,8 +131,9 @@ static void test_formatting(void) {
 }
 
 int main(void) {
-    test_scan_aggregates_and_groups();
-    test_layout_stays_inside_view();
+    test_scan_aggregates_and_direct_entries();
+    test_lazy_directories();
+    test_replaced_lazy_directory();
     test_formatting();
     puts("dupmap tests: all passed");
     return 0;
