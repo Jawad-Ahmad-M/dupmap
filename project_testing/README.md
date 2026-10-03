@@ -1,7 +1,9 @@
 # dupmap test fixture
 
-This directory is a deterministic fixture for testing the scanner and duplicate
-report. Run dupmap against this directory, not the repository root:
+This directory is a deterministic integration fixture for testing the scanner,
+duplicate report, filename handling, and nested paths. `make test` runs the
+fixture CLI checks automatically. To inspect it manually, run dupmap against
+this directory, not the repository root:
 
 ```sh
 ./dupmap --dupes project_testing
@@ -16,7 +18,7 @@ Expected duplicate groups before running the setup script:
 - `same-size-different-content`: no duplicate group
 - `empty`: two identical empty files, one duplicate group
 
-Run the optional Linux-only edge-case setup from the repository root:
+Run the optional Linux-only symlink and permissions setup from the repository root:
 
 ```sh
 bash project_testing/setup_edge_cases.sh

@@ -32,7 +32,10 @@ cmake -S . -B build-cmake
 cmake --build build-cmake
 ```
 
-Run the core and duplicate detection checks with `make test`.
+Run the scanner, duplicate, layout, edge-case, and fixture CLI checks with
+`make test`. Run the same CTest suite with
+`ctest --test-dir build-cmake --output-on-failure`. On GCC or Clang, `make sanitize` runs the checks with
+AddressSanitizer and UndefinedBehaviorSanitizer enabled.
 
 ## Use
 
@@ -55,14 +58,17 @@ and estimated reclaimable space, then exits without starting the TUI.
 | `l` | Toggle treemap/list view |
 | `f` | Enter a name filter in list view (empty clears it) |
 | `s` | Cycle size, name, and modified-time sorting |
-| `c` | Cycle depth, file-type, and size-heat colors |
+| `c` | Cycle depth, file-type, and size-heat colors when supported by the terminal |
+| `?` | Show keyboard help (`?` or Escape closes it) |
 | `q` | Quit |
 
 Selection briefly pulses as visual feedback when moving through the treemap.
 Tiny files are grouped under an `other` folder so they remain accessible while
-keeping the treemap readable. The selected item's full path and size appear
-below the view; duplicate files have a red fill, and the selected tile uses a
-contrasting fill.
+keeping the treemap readable. The header shows the current path and total size;
+the status line shows the selected item's name, size, and position. Duplicate
+files have a red fill when colors are available and a `*` marker in all modes.
+On color terminals, selected tiles pulse between contrasting solid fills.
+Monochrome terminals use reverse video and omit color controls.
 
 ## Data and limitations
 

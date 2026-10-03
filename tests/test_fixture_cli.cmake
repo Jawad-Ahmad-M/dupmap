@@ -1,0 +1,43 @@
+execute_process(COMMAND "${DUPMAP}" --help RESULT_VARIABLE help_result OUTPUT_VARIABLE help_output)
+if(NOT help_result EQUAL 0 OR NOT help_output MATCHES "shows keyboard help")
+    message(FATAL_ERROR "dupmap --help check failed:\n${help_output}")
+endif()
+execute_process(COMMAND "${DUPMAP}" --version RESULT_VARIABLE version_result OUTPUT_VARIABLE version_output)
+if(NOT version_result EQUAL 0 OR NOT version_output MATCHES "^dupmap ")
+    message(FATAL_ERROR "dupmap --version check failed:\n${version_output}")
+endif()
+file(SIZE "${FIXTURE}/same-size-different-content/alpha.txt" alpha_size)
+file(SIZE "${FIXTURE}/same-size-different-content/beta.txt" beta_size)
+if(NOT alpha_size EQUAL beta_size)
+    message(FATAL_ERROR "same-size non-duplicate fixture files differ in size")
+endif()
+
+execute_process(
+    COMMAND "${DUPMAP}" --dupes "${FIXTURE}"
+    RESULT_VARIABLE result
+    OUTPUT_VARIABLE output
+    ERROR_VARIABLE error)
+if(NOT result EQUAL 0)
+    message(FATAL_ERROR "dupmap --dupes failed (${result}): ${error}")
+endif()
+if(NOT output MATCHES "Duplicate groups: 4")
+    message(FATAL_ERROR "Expected 4 duplicate groups; got:\n${output}")
+endif()
+if(NOT output MATCHES "original[.]txt" OR NOT output MATCHES "file with spaces[.]txt" OR NOT output MATCHES "empty-a")
+    message(FATAL_ERROR "Fixture output is missing expected duplicate members:\n${output}")
+endif()
+if(output MATCHES "same-size-different-content/alpha[.]txt")
+    message(FATAL_ERROR "Different-content files were incorrectly reported as duplicates:\n${output}")
+endif()
+
+if(UNIX)
+    set(link_path "${CMAKE_CURRENT_BINARY_DIR}/dupmap_fixture_root_link")
+    file(REMOVE "${link_path}")
+    file(CREATE_LINK "${FIXTURE}" "${link_path}" SYMBOLIC)
+    execute_process(COMMAND "${DUPMAP}" "${link_path}/"
+        RESULT_VARIABLE link_result OUTPUT_VARIABLE link_output ERROR_VARIABLE link_error)
+    file(REMOVE "${link_path}")
+    if(link_result EQUAL 0 OR NOT link_error MATCHES "symbolic links are skipped")
+        message(FATAL_ERROR "symbolic-link root rejection check failed: ${link_error}")
+    endif()
+endif()

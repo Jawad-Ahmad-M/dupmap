@@ -1,8 +1,10 @@
 #define _DEFAULT_SOURCE
+#define _XOPEN_SOURCE 700
 #include <dirent.h>
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
+#include <locale.h>
 #include <ncurses.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +15,7 @@
 #include <stdint.h>
 #include <time.h>
 #include <unistd.h>
+#include <wchar.h>
 
 #define DUPMAP_VERSION "0.1.0"
 
@@ -37,8 +40,119 @@ typedef struct { Box *items; size_t count, cap; } BoxList;
 typedef struct { Node **files; size_t count; off_t size; } DuplicateGroup;
 static int sort_mode = 0; /* 0 size, 1 name, 2 modified */
 static int color_mode = 0; /* 0 depth, 1 file type, 2 size heat */
+static int ui_active;
+static size_t ui_work_count;
+static int ui_color_enabled;
 
-static void die(const char *message) { endwin(); fprintf(stderr, "dupmap: %s\n", message); exit(EXIT_FAILURE); }
+static size_t next_character(const char *text, mbstate_t *state, int *cells) {
+    wchar_t character;
+    size_t bytes = mbrtowc(&character, text, MB_CUR_MAX, state);
+    if (bytes == (size_t)-1 || bytes == (size_t)-2) {
+        memset(state, 0, sizeof(*state));
+        *cells = 1;
+        unsigned char lead = (unsigned char)text[0];
+        size_t length = lead >= 0xF0 && lead <= 0xF4 ? 4 :
+                        (lead >= 0xE0 && lead <= 0xEF ? 3 :
+                        (lead >= 0xC2 && lead <= 0xDF ? 2 : 1));
+        for (size_t i = 1; i < length; ++i)
+            if (!text[i] || ((unsigned char)text[i] & 0xC0) != 0x80) return 1;
+        return length;
+    }
+    if (!bytes) return 0;
+    *cells = wcwidth(character);
+    if (*cells < 0) *cells = 1;
+    return bytes;
+}
+
+static int text_width(const char *text) {
+    mbstate_t state = {0};
+    int width = 0, cells;
+    while (*text) {
+        size_t bytes = next_character(text, &state, &cells);
+        if (!bytes) break;
+        width += cells;
+        text += bytes;
+    }
+    return width;
+}
+
+static void clip_text(const char *text, int width, char *out, size_t out_size) {
+    if (!out_size) return;
+    if (width <= 0) { out[0] = '\0'; return; }
+    if (text_width(text) <= width) {
+        snprintf(out, out_size, "%s", text);
+        return;
+    }
+    int budget = width > 3 ? width - 3 : width;
+    size_t copied = 0;
+    mbstate_t state = {0};
+    int used = 0, cells;
+    while (*text) {
+        size_t bytes = next_character(text, &state, &cells);
+        if (!bytes || used + cells > budget || copied + bytes + 4 > out_size) break;
+        memcpy(out + copied, text, bytes);
+        copied += bytes;
+        used += cells;
+        text += bytes;
+    }
+    if (width > 3 && copied + 4 <= out_size) {
+        memcpy(out + copied, "...", 4);
+    } else out[copied] = '\0';
+}
+
+static void clip_tail(const char *text, int width, char *out, size_t out_size) {
+    if (!out_size) return;
+    if (text_width(text) <= width) { snprintf(out, out_size, "%s", text); return; }
+    if (width <= 3) { clip_text(text, width, out, out_size); return; }
+    int budget = width - 3;
+    size_t offset = 0;
+    int suffix_width = text_width(text);
+    mbstate_t state = {0};
+    int cells;
+    while (text[offset] && suffix_width > budget) {
+        size_t bytes = next_character(text + offset, &state, &cells);
+        if (!bytes) break;
+        offset += bytes;
+        suffix_width -= cells;
+    }
+    snprintf(out, out_size, "...%s", text + offset);
+}
+
+static int tile_selection_attrs(int selected, int colors, int pulse) {
+    if (!selected) return 0;
+    int attrs = A_BOLD;
+    if (!colors) attrs |= A_REVERSE;
+    (void)pulse;
+    return attrs;
+}
+
+static int tile_color_pair(int selected, int pulse, int color) {
+    return selected ? (pulse ? 9 : 8) : color;
+}
+
+static void die(const char *message) {
+    if (ui_active) endwin();
+    fprintf(stderr, "dupmap: %s\n", message);
+    exit(EXIT_FAILURE);
+}
+
+static off_t max_off_t_value(void) {
+    unsigned shift = (unsigned)(sizeof(uintmax_t) * CHAR_BIT - sizeof(off_t) * CHAR_BIT + 1);
+    return (off_t)(UINTMAX_MAX >> shift);
+}
+
+static void show_progress(const char *phase, const char *path) {
+    if (!ui_active) return;
+    int rows, cols;
+    getmaxyx(stdscr, rows, cols);
+    if (rows < 1 || cols < 1) return;
+    char message[PATH_MAX + 80];
+    snprintf(message, sizeof(message), "%s: %s  (%zu entries)", phase, path, ui_work_count);
+    char clipped[PATH_MAX + 80];
+    clip_text(message, cols, clipped, sizeof(clipped));
+    mvaddnstr(rows - 1, 0, clipped, (int)strlen(clipped));
+    refresh();
+}
 
 static char *copy_string(const char *s) {
     char *copy = strdup(s);
@@ -76,8 +190,11 @@ static void add_child(Node *parent, Node *child) {
     }
     parent->children[parent->child_count++] = child;
     child->parent = parent;
-    parent->size += child->size;
-    parent->file_count += child->file_count;
+    off_t max_size = max_off_t_value();
+    if (child->size > 0 && parent->size > max_size - child->size) parent->size = max_size;
+    else parent->size += child->size;
+    if (child->file_count > SIZE_MAX - parent->file_count) parent->file_count = SIZE_MAX;
+    else parent->file_count += child->file_count;
 }
 
 static int compare_nodes(const void *a, const void *b) {
@@ -91,6 +208,17 @@ static int compare_nodes(const void *a, const void *b) {
     if (left->size < right->size) return 1;
     if (left->size > right->size) return -1;
     return strcasecmp(left->name, right->name);
+}
+
+static void sort_children(Node *parent) {
+    if (parent->child_count)
+        qsort(parent->children, parent->child_count, sizeof(*parent->children), compare_nodes);
+}
+
+static size_t child_index(Node *parent, Node *child) {
+    for (size_t i = 0; i < parent->child_count; ++i)
+        if (parent->children[i] == child) return i;
+    return 0;
 }
 
 static void free_node(Node *node);
@@ -120,6 +248,8 @@ static int files_equal(const char *left_path, const char *right_path) {
 
 typedef struct { Node **items; size_t count, cap; } FileList;
 static void collect_files(Node *node, FileList *list) {
+    ++ui_work_count;
+    if ((ui_work_count & 255) == 0) show_progress("Collecting files", node->path);
     if (!node->is_dir) {
         if (list->count == list->cap) {
             size_t next = list->cap ? list->cap * 2 : 64;
@@ -135,14 +265,19 @@ static void collect_files(Node *node, FileList *list) {
 static size_t find_duplicate_groups(Node *root, DuplicateGroup **out) {
     FileList files = {0}; collect_files(root, &files);
     unsigned char *used = calloc(files.count, 1);
+    uint64_t *hashes = malloc(files.count * sizeof(*hashes));
     DuplicateGroup *groups = NULL; size_t count = 0, cap = 0;
-    if (!used && files.count) die("out of memory");
+    if ((!used || !hashes) && files.count) die("out of memory");
+    for (size_t i = 0; i < files.count; ++i) {
+        hashes[i] = file_hash(files.items[i]->path);
+        ui_work_count = i + 1;
+        if ((i & 63) == 0) show_progress("Checking duplicates", files.items[i]->name);
+    }
     for (size_t i = 0; i < files.count; ++i) {
         if (used[i]) continue;
-        uint64_t hash = file_hash(files.items[i]->path);
         Node **matches = NULL; size_t match_count = 0, match_cap = 0;
         for (size_t j = i; j < files.count; ++j) {
-            if (used[j] || files.items[j]->size != files.items[i]->size || file_hash(files.items[j]->path) != hash) continue;
+            if (used[j] || files.items[j]->size != files.items[i]->size || hashes[j] != hashes[i]) continue;
             int equal = match_count == 0 || files_equal(files.items[i]->path, files.items[j]->path);
             if (!equal) continue;
             if (match_count == match_cap) {
@@ -164,7 +299,7 @@ static size_t find_duplicate_groups(Node *root, DuplicateGroup **out) {
             groups[count++] = (DuplicateGroup){matches, match_count, files.items[i]->size};
         } else free(matches);
     }
-    free(used); free(files.items); *out = groups; return count;
+    free(hashes); free(used); free(files.items); *out = groups; return count;
 }
 
 static void free_duplicate_groups(DuplicateGroup *groups, size_t count) {
@@ -173,6 +308,8 @@ static void free_duplicate_groups(DuplicateGroup *groups, size_t count) {
 }
 
 static Node *scan_path(const char *path, const char *display_name, int is_root) {
+    ++ui_work_count;
+    if ((ui_work_count & 63) == 0) show_progress("Scanning", path);
     struct stat st;
     if (lstat(path, &st) != 0) return NULL;
     if (S_ISLNK(st.st_mode)) return NULL;
@@ -188,20 +325,23 @@ static Node *scan_path(const char *path, const char *display_name, int is_root) 
     DIR *handle = opendir(path);
     if (!handle) { dir->inaccessible = 1; return dir; }
     struct dirent *entry;
-    while ((entry = readdir(handle)) != NULL) {
+    for (;;) {
+        errno = 0;
+        entry = readdir(handle);
+        if (!entry) { if (errno) dir->inaccessible = 1; break; }
         if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
         char *child_path = join_path(path, entry->d_name);
         Node *child = scan_path(child_path, entry->d_name, 0);
         free(child_path);
         if (child) add_child(dir, child);
     }
-    closedir(handle);
+    if (closedir(handle) != 0) dir->inaccessible = 1;
     /* Keep tiny files from producing unreadable one-cell boxes. Directories
        are never grouped because they must remain independently navigable. */
     const off_t tiny_limit = 4096;
-    Node **kept = malloc(dir->child_cap * sizeof(*kept));
-    Node **tiny = malloc(dir->child_cap * sizeof(*tiny));
-    if (!kept || !tiny) die("out of memory");
+    Node **kept = dir->child_cap ? malloc(dir->child_cap * sizeof(*kept)) : NULL;
+    Node **tiny = dir->child_cap ? malloc(dir->child_cap * sizeof(*tiny)) : NULL;
+    if (dir->child_cap && (!kept || !tiny)) die("out of memory");
     size_t kept_count = 0, tiny_count = 0;
     for (size_t i = 0; i < dir->child_count; ++i) {
         Node *child = dir->children[i];
@@ -214,14 +354,25 @@ static Node *scan_path(const char *path, const char *display_name, int is_root) 
     for (size_t i = 0; i < kept_count; ++i) add_child(dir, kept[i]);
     free(kept);
     if (tiny_count > 0) {
-        char *other_path = join_path(path, "other");
-        Node *other = new_node("other", other_path, 1);
+        char other_name[64] = "other";
+        unsigned suffix = 2;
+        for (;;) {
+            int in_use = 0;
+            for (size_t i = 0; i < dir->child_count; ++i)
+                if (!strcmp(dir->children[i]->name, other_name)) { in_use = 1; break; }
+            for (size_t i = 0; i < tiny_count && !in_use; ++i)
+                if (!strcmp(tiny[i]->name, other_name)) in_use = 1;
+            if (!in_use) break;
+            snprintf(other_name, sizeof(other_name), "other (%u)", suffix++);
+        }
+        char *other_path = join_path(path, other_name);
+        Node *other = new_node(other_name, other_path, 1);
         free(other_path);
         for (size_t i = 0; i < tiny_count; ++i) add_child(other, tiny[i]);
         add_child(dir, other);
     }
     free(tiny);
-    if (dir->child_count) qsort(dir->children, dir->child_count, sizeof(*dir->children), compare_nodes);
+    sort_children(dir);
     (void)is_root;
     return dir;
 }
@@ -250,9 +401,75 @@ static double aspect(double area, double short_side) {
     return long_side > short_side ? long_side / short_side : short_side / long_side;
 }
 
+static size_t layout_scaled(Node *parent, int x, int y, int w, int h, BoxList *boxes) {
+    size_t capacity = (size_t)w * (size_t)h, count = 0;
+    for (size_t i = 0; i < parent->child_count && count < capacity; ++i)
+        if (parent->children[i]->size > 0) ++count;
+    if (!count) return 0;
+
+    Node **items = malloc(count * sizeof(*items));
+    if (!items) die("out of memory");
+    size_t used = 0;
+    long double remaining_weight = 0;
+    for (size_t i = 0; i < parent->child_count && used < count; ++i) {
+        if (parent->children[i]->size <= 0) continue;
+        items[used++] = parent->children[i];
+        remaining_weight += parent->children[i]->size;
+    }
+
+    int columns = 1;
+    while (columns < w && (long double)columns * columns * h < (long double)count * w) ++columns;
+    int min_columns = (int)((count + (size_t)h - 1) / (size_t)h);
+    if (columns < min_columns) columns = min_columns;
+    if ((size_t)columns > count) columns = (int)count;
+
+    int remaining_height = h, top = y;
+    size_t offset = 0;
+    while (offset < count) {
+        size_t row_count = count - offset;
+        if (row_count > (size_t)columns) row_count = (size_t)columns;
+        long double row_weight = 0;
+        for (size_t i = 0; i < row_count; ++i) row_weight += items[offset + i]->size;
+        size_t rows_after = (count - offset - row_count + (size_t)columns - 1) / (size_t)columns;
+        int row_height = rows_after ? (int)((long double)remaining_height * row_weight / remaining_weight + 0.5L)
+                                    : remaining_height;
+        if (row_height < 1) row_height = 1;
+        if (row_height > remaining_height - (int)rows_after) row_height = remaining_height - (int)rows_after;
+
+        int left = x, remaining_width = w;
+        long double width_weight = row_weight;
+        for (size_t i = 0; i < row_count; ++i) {
+            size_t after = row_count - i - 1;
+            int tile_width = remaining_width;
+            if (after) {
+                tile_width = (int)((long double)remaining_width * items[offset + i]->size / width_weight + 0.5L);
+                if (tile_width < 1) tile_width = 1;
+                if (tile_width > remaining_width - (int)after) tile_width = remaining_width - (int)after;
+            }
+            add_box(boxes, left, top, tile_width, row_height, items[offset + i], parent->size);
+            left += tile_width;
+            remaining_width -= tile_width;
+            width_weight -= items[offset + i]->size;
+        }
+        top += row_height;
+        remaining_height -= row_height;
+        remaining_weight -= row_weight;
+        offset += row_count;
+    }
+    free(items);
+    return count;
+}
+
 /* Squarified treemap layout. Coordinates are terminal cells. */
 static void layout_children(Node *parent, int x, int y, int w, int h, BoxList *boxes) {
     if (!parent->child_count || w < 1 || h < 1) return;
+    size_t initial_count = boxes->count, positive_count = 0;
+    for (size_t i = 0; i < parent->child_count; ++i)
+        if (parent->children[i]->size > 0) ++positive_count;
+    if (positive_count > 256) {
+        layout_scaled(parent, x, y, w, h, boxes);
+        return;
+    }
     size_t start = 0;
     int left = x, top = y, width = w, height = h;
     while (start < parent->child_count && width > 0 && height > 0) {
@@ -317,6 +534,11 @@ static void layout_children(Node *parent, int x, int y, int w, int h, BoxList *b
         else { left += row_size; width -= row_size; }
         start = best_end + 1;
     }
+    size_t laid_out = boxes->count - initial_count;
+    if (laid_out < positive_count) {
+        boxes->count = initial_count;
+        layout_scaled(parent, x, y, w, h, boxes);
+    }
 }
 
 static int depth_color(int depth) { return 1 + (depth % 6); }
@@ -350,31 +572,35 @@ static void draw_box(const Box *box, int selected, int depth, int pulse) {
     int x = box->x, y = box->y, w = box->w, h = box->h;
     /* Leave a cell gutter around roomy tiles; preserve every cell in tight layouts. */
     if (w >= 6 && h >= 4) { ++x; ++y; w -= 2; h -= 2; }
-    attron(COLOR_PAIR(selected ? 8 : color));
+    int pair = ui_color_enabled ? COLOR_PAIR(tile_color_pair(selected, pulse, color)) : 0;
+    int selection = tile_selection_attrs(selected, ui_color_enabled, pulse);
+    attron(pair | selection);
     for (int row = y; row < y + h; ++row) {
         for (int col = x; col < x + w; ++col) mvaddch(row, col, ' ');
     }
 
-    if (selected) attron(A_BOLD | (pulse ? A_UNDERLINE : 0));
+    if (selected) attron(selection);
     else if (box->node->is_dir) attron(A_BOLD);
     if (w >= 3 && h >= 1) {
         int start_x = x;
         int label_row = y;
-        int max = w; char label[256];
+        int max = w; char label[PATH_MAX + 64];
+        const char *mark = box->node->is_duplicate ? "* " : "";
         if (box->node->is_dir && w >= 18 && h >= 4)
-            snprintf(label, sizeof(label), "%s [%zu] %.1f%%", box->node->name, box->node->file_count, box->percent);
-        else if (box->node->is_dir) snprintf(label, sizeof(label), "%s/ [%zu]", box->node->name, box->node->file_count);
-        else if (w >= 18 && h >= 4) snprintf(label, sizeof(label), "%s  %.1f%%", box->node->name, box->percent);
-        else snprintf(label, sizeof(label), "%s", box->node->name);
-        if ((int)strlen(label) > max) { if (max > 3) { label[max - 3] = '.'; label[max - 2] = '.'; label[max - 1] = '.'; label[max] = '\0'; } else label[max] = '\0'; }
-        mvaddnstr(label_row, start_x, label, max);
+            snprintf(label, sizeof(label), "%s%s [%zu] %.1f%%", mark, box->node->name, box->node->file_count, box->percent);
+        else if (box->node->is_dir) snprintf(label, sizeof(label), "%s%s/ [%zu]", mark, box->node->name, box->node->file_count);
+        else if (w >= 18 && h >= 4) snprintf(label, sizeof(label), "%s%s  %.1f%%", mark, box->node->name, box->percent);
+        else snprintf(label, sizeof(label), "%s%s", mark, box->node->name);
+        char clipped[PATH_MAX + 64];
+        clip_text(label, max, clipped, sizeof(clipped));
+        mvaddnstr(label_row, start_x, clipped, (int)strlen(clipped));
     }
-    attroff(A_REVERSE | A_BOLD); attroff(COLOR_PAIR(selected ? 8 : color));
+    attroff(A_REVERSE | A_BOLD | A_UNDERLINE); attroff(pair);
 }
 
 static void format_size(off_t value, char *out, size_t length) {
-    const char *units[] = {"B", "K", "M", "G", "T"}; double size = (double)value; int unit = 0;
-    while (size >= 1024 && unit < 4) { size /= 1024; ++unit; }
+    const char *units[] = {"B", "K", "M", "G", "T", "P", "E"}; double size = (double)value; int unit = 0;
+    while (size >= 1024 && unit < 6) { size /= 1024; ++unit; }
     snprintf(out, length, unit ? "%.1f %s" : "%.0f %s", size, units[unit]);
 }
 
@@ -383,18 +609,38 @@ static const char *sort_name(void) {
 }
 
 static const char *color_name(void) {
+    if (!ui_color_enabled) return "mono";
     return color_mode == 1 ? "type" : (color_mode == 2 ? "heat" : "depth");
+}
+
+static const char *keyboard_hint(int cols) {
+    if (cols >= 100)
+        return ui_color_enabled
+            ? "Arrows select  Enter open  Backspace up  l:list  f:filter  s:sort  c:color  ? help  q:quit"
+            : "Arrows select  Enter open  Backspace up  l:list  f:filter  s:sort  ? help  q:quit";
+    if (cols >= 76)
+        return ui_color_enabled
+            ? "Arrows  Enter  Backspace  L list  F filter  S sort  C color  ? help"
+            : "Arrows  Enter  Backspace  L list  F filter  S sort  ? help";
+    if (cols >= 48)
+        return ui_color_enabled
+            ? "Arrows move  Enter open  Backspace up  L list  F filter  S sort  C color  ? help"
+            : "Arrows move  Enter open  Backspace up  L list  F filter  S sort  ? help";
+    return cols >= 32 ? "Arrows move  Enter open  Backspace up  ? help"
+                      : "Arrows move  Enter open  ? help";
 }
 
 static int load_state(char *last_path, size_t path_length, int *saved_sort, int *saved_color, int *saved_list) {
     const char *base = getenv("XDG_STATE_HOME");
     char state_path[PATH_MAX];
-    if (base && *base) snprintf(state_path, sizeof(state_path), "%s/dupmap/state", base);
+    int length;
+    if (base && *base) length = snprintf(state_path, sizeof(state_path), "%s/dupmap/state", base);
     else {
         const char *home = getenv("HOME");
         if (!home || !*home) return 0;
-        snprintf(state_path, sizeof(state_path), "%s/.config/dupmap/state", home);
+        length = snprintf(state_path, sizeof(state_path), "%s/.config/dupmap/state", home);
     }
+    if (length < 0 || (size_t)length >= sizeof(state_path)) return 0;
     FILE *file = fopen(state_path, "r");
     if (!file) return 0;
     if (!fgets(last_path, (int)path_length, file)) { fclose(file); return 0; }
@@ -409,12 +655,14 @@ static int load_state(char *last_path, size_t path_length, int *saved_sort, int 
 static void save_state(const char *last_path, int saved_sort, int saved_color, int saved_list) {
     const char *base = getenv("XDG_STATE_HOME");
     char state_dir[PATH_MAX], state_path[PATH_MAX];
-    if (base && *base) snprintf(state_dir, sizeof(state_dir), "%s/dupmap", base);
+    int length;
+    if (base && *base) length = snprintf(state_dir, sizeof(state_dir), "%s/dupmap", base);
     else {
         const char *home = getenv("HOME");
         if (!home || !*home) return;
-        snprintf(state_dir, sizeof(state_dir), "%s/.config/dupmap", home);
+        length = snprintf(state_dir, sizeof(state_dir), "%s/.config/dupmap", home);
     }
+    if (length < 0 || (size_t)length >= sizeof(state_dir)) return;
     if (mkdir(state_dir, 0700) != 0 && errno != EEXIST) return;
     size_t directory_length = strlen(state_dir);
     if (directory_length + strlen("/state") >= sizeof(state_path)) return;
@@ -447,7 +695,27 @@ static size_t next_match(Node *parent, size_t selected, int direction, const cha
     return selected;
 }
 
+static size_t list_window_start(Node *parent, size_t selected, int rows, const char *query) {
+    if (!parent->child_count || rows <= 1) return selected;
+    if (selected >= parent->child_count) selected = parent->child_count - 1;
+    size_t first = selected;
+    int preceding = 0;
+    while (first > 0 && preceding < rows - 1) {
+        --first;
+        if (name_matches(parent->children[first]->name, query)) ++preceding;
+    }
+    return first;
+}
+
+static size_t matching_count(Node *parent, const char *query) {
+    size_t count = 0;
+    for (size_t i = 0; i < parent->child_count; ++i)
+        if (name_matches(parent->children[i]->name, query)) ++count;
+    return count;
+}
+
 int main(int argc, char **argv) {
+    setlocale(LC_CTYPE, "");
     if (argc > 1 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
         printf("Usage: dupmap [options] [path]\n\n"
                "Options:\n"
@@ -456,7 +724,7 @@ int main(int argc, char **argv) {
                "  -v, --version   show version\n\n"
                "Interactive keys: arrows select, Enter opens, Backspace goes up,\n"
                "l toggles the complete list view, f filters names, s cycles sorting,\n"
-               "c cycles colors, q quits.\n");
+               "c cycles colors, ? shows keyboard help, q quits.\n");
         return EXIT_SUCCESS;
     }
     if (argc > 1 && (!strcmp(argv[1], "--version") || !strcmp(argv[1], "-v"))) {
@@ -470,14 +738,56 @@ int main(int argc, char **argv) {
     else if (argc > 1) root_path = argv[1];
     else if (load_state(saved_path, sizeof(saved_path), &sort_mode, &color_mode, &saved_list_mode)) root_path = saved_path;
     else root_path = getcwd(cwd, sizeof(cwd)) ? cwd : ".";
+    char root_check[PATH_MAX];
+    size_t root_length = strlen(root_path);
+    if (root_length < sizeof(root_check)) {
+        memcpy(root_check, root_path, root_length + 1);
+        while (root_length > 1 && root_check[root_length - 1] == '/') root_check[--root_length] = '\0';
+        struct stat root_stat;
+        if (lstat(root_check, &root_stat) == 0 && S_ISLNK(root_stat.st_mode)) {
+            fprintf(stderr, "dupmap: cannot read '%s': symbolic links are skipped\n", root_path);
+            return EXIT_FAILURE;
+        }
+    }
     char resolved[PATH_MAX]; if (realpath(root_path, resolved)) root_path = resolved;
+    if (!dupes_mode) {
+        if (!initscr()) { fprintf(stderr, "dupmap: cannot initialize terminal UI\n"); return EXIT_FAILURE; }
+        ui_active = 1; cbreak(); noecho(); keypad(stdscr, TRUE); curs_set(0);
+        ui_color_enabled = has_colors() && COLOR_PAIRS > 9 && start_color() != ERR;
+        if (ui_color_enabled) {
+            int color_setup_ok = 1;
+            for (int i = 1; i <= 6; ++i) {
+                short foreground = (i == COLOR_YELLOW || i == COLOR_CYAN) ? COLOR_BLACK : COLOR_WHITE;
+                if (init_pair(i, foreground, (short)i) == ERR) color_setup_ok = 0;
+            }
+            if (init_pair(7, COLOR_WHITE, COLOR_RED) == ERR ||
+                init_pair(8, COLOR_BLACK, COLOR_WHITE) == ERR ||
+                init_pair(9, COLOR_BLACK, COLOR_CYAN) == ERR) color_setup_ok = 0;
+            ui_color_enabled = color_setup_ok;
+        }
+        ui_work_count = 0;
+        show_progress("Scanning", root_path);
+    }
     Node *root = scan_path(root_path, root_path, 1);
-    if (!root) { fprintf(stderr, "dupmap: cannot read '%s': %s\n", root_path, strerror(errno)); return EXIT_FAILURE; }
+    if (!root) {
+        if (ui_active) { endwin(); ui_active = 0; }
+        fprintf(stderr, "dupmap: cannot read '%s': %s\n", root_path, strerror(errno));
+        return EXIT_FAILURE;
+    }
+    if (!dupes_mode && !root->is_dir) {
+        endwin(); ui_active = 0; free_node(root);
+        fprintf(stderr, "dupmap: '%s' is not a directory\n", root_path);
+        return EXIT_FAILURE;
+    }
     if (dupes_mode) {
         DuplicateGroup *groups = NULL; size_t group_count = find_duplicate_groups(root, &groups);
         printf("Duplicate groups: %zu\n", group_count);
         for (size_t i = 0; i < group_count; ++i) {
-            char size_text[32]; format_size(groups[i].size * (off_t)(groups[i].count - 1), size_text, sizeof(size_text));
+            size_t copies = groups[i].count - 1;
+            off_t max_size = max_off_t_value();
+            off_t reclaimable = groups[i].size > 0 && copies > (size_t)(max_size / groups[i].size)
+                                  ? max_size : groups[i].size * (off_t)copies;
+            char size_text[32]; format_size(reclaimable, size_text, sizeof(size_text));
             printf("\n%s reclaimable (%zu files):\n", size_text, groups[i].count);
             for (size_t j = 0; j < groups[i].count; ++j) printf("  %s\n", groups[i].files[j]->path);
         }
@@ -485,13 +795,14 @@ int main(int argc, char **argv) {
     }
 
     DuplicateGroup *duplicate_groups = NULL;
+    ui_work_count = 0;
+    show_progress("Checking duplicates", root_path);
     size_t duplicate_group_count = find_duplicate_groups(root, &duplicate_groups);
-    initscr(); cbreak(); noecho(); keypad(stdscr, TRUE); curs_set(0); start_color(); use_default_colors();
-    for (int i = 1; i <= 6; ++i) init_pair(i, COLOR_WHITE, i);
-    init_pair(7, COLOR_WHITE, COLOR_RED);
-    init_pair(8, COLOR_BLACK, COLOR_WHITE);
     Node *current = root; size_t selected = 0; int list_mode = saved_list_mode; char filter[256] = "";
-    int pulse_frames = 0;
+    int pulse_frames = 0, help_mode = 0;
+    BoxList boxes = {0};
+    Node *layout_parent = NULL;
+    int layout_cols = -1, layout_height = -1, layout_sort = -1;
     for (;;) {
         int rows, cols; getmaxyx(stdscr, rows, cols); erase();
         if (rows < 6 || cols < 16) {
@@ -503,68 +814,109 @@ int main(int argc, char **argv) {
             continue;
         }
         char size_text[32]; format_size(current->size, size_text, sizeof(size_text));
-        const char *directory_name = strrchr(current->path, '/');
-        directory_name = directory_name ? directory_name + 1 : current->path;
-        if (!*directory_name) directory_name = current->path;
+        int size_width = cols >= 24 ? (int)strlen(size_text) + 2 : 0;
+        int path_width = cols - 8 - size_width;
+        if (path_width < 1) path_width = 1;
+        char short_path[PATH_MAX + 8];
+        clip_tail(current->path, path_width, short_path, sizeof(short_path));
         char header[PATH_MAX + 32];
-        snprintf(header, sizeof(header), "dupmap  %s", directory_name);
+        snprintf(header, sizeof(header), "dupmap  %s", short_path);
         attron(A_BOLD);
-        mvaddnstr(0, 0, header, cols > 18 ? cols - 18 : cols);
+        mvaddnstr(0, 0, header, (int)strlen(header));
         attroff(A_BOLD);
         if (cols >= 24) mvprintw(0, cols - (int)strlen(size_text) - 2, "%s", size_text);
-        const char *help = cols >= 65 ? "Arrows select  Enter open  Backspace up  l:list  f:filter  s:sort  c:color  q:quit" :
-                           (cols >= 32 ? "Arrows move  Enter open  Backspace up  q quit" : "Arrows move  Enter open  q quit");
+        const char *help = keyboard_hint(cols);
         mvaddnstr(1, 0, help, cols);
-        BoxList boxes = {0};
         int view_y = 2;
         int footer_rows = rows >= 10 ? 2 : 1;
-        layout_children(current, 0, view_y, cols, rows - view_y - footer_rows, &boxes);
-        int auto_list = cols < 48 || rows < 12 || boxes.count < current->child_count ||
-                        boxes.count > (size_t)(cols * (rows - view_y - footer_rows) / 3);
+        int view_height = rows - view_y - footer_rows;
+        size_t visible_items = 0;
+        for (size_t i = 0; i < current->child_count; ++i)
+            if (current->children[i]->size > 0) ++visible_items;
+        size_t cell_capacity = (size_t)cols * (size_t)view_height;
+        int over_capacity = current->child_count > cell_capacity;
+        int has_zero_size = visible_items < current->child_count;
+        int auto_list = cols < 48 || rows < 12 || over_capacity || has_zero_size;
         int show_list = list_mode || auto_list;
+        if (!show_list && (layout_parent != current || layout_cols != cols || layout_height != view_height || layout_sort != sort_mode)) {
+            free(boxes.items);
+            boxes = (BoxList){0};
+            layout_children(current, 0, view_y, cols, view_height, &boxes);
+            layout_parent = current;
+            layout_cols = cols;
+            layout_height = view_height;
+            layout_sort = sort_mode;
+        }
         Node *selected_node = NULL;
-        if (show_list) {
+        if (help_mode) {
+            const char *help_lines[] = {
+                "Keyboard help", "Arrows: move selection  Enter: open folder",
+                "Backspace: parent       L: toggle list view", "F: filter names         S: change sort",
+                ui_color_enabled ? "C: change colors        ?: close help" : "Colors unavailable        ?: close help",
+                "Q: quit"
+            };
+            int help_count = rows - footer_rows - 2;
+            if (help_count > (int)(sizeof(help_lines) / sizeof(help_lines[0]))) help_count = (int)(sizeof(help_lines) / sizeof(help_lines[0]));
+            for (int i = 0; i < help_count; ++i) mvaddnstr(2 + i, 0, help_lines[i], cols);
+        } else if (show_list) {
             if (filter[0] && (!current->child_count || !name_matches(current->children[selected < current->child_count ? selected : 0]->name, filter))) selected = next_match(current, 0, 1, filter);
             if (selected >= current->child_count && current->child_count) selected = current->child_count - 1;
             int list_start = rows >= 10 ? 3 : view_y;
             int list_rows = rows - footer_rows - list_start;
             if (list_rows < 1) list_rows = 1;
-            size_t first = selected >= (size_t)list_rows ? selected - (size_t)list_rows + 1 : 0;
-            if (rows >= 10) mvprintw(2, 0, "Contents (%zu items)%s:", current->child_count, auto_list && !list_mode ? " (list view: crowded or compact terminal)" : "");
+            size_t first = list_window_start(current, selected, list_rows, filter);
+            if (rows >= 10) mvprintw(2, 0, "Contents (%zu items)%s:", filter[0] ? matching_count(current, filter) : current->child_count,
+                                     auto_list && !list_mode ? (over_capacity ? " (too many items for tiles)" :
+                                     (has_zero_size ? " (zero-size items)" : " (compact terminal)")) : "");
             size_t shown = 0;
-            for (size_t i = first; i < current->child_count && (int)(i - first) < list_rows; ++i) {
+            for (size_t i = first; i < current->child_count && shown < (size_t)list_rows; ++i) {
                 Node *item = current->children[i]; char item_size[32]; format_size(item->size, item_size, sizeof(item_size));
                 if (!name_matches(item->name, filter)) continue;
                 int line = list_start + (int)shown;
                 if (line >= rows - footer_rows) break;
                 char entry[PATH_MAX + 64];
-                snprintf(entry, sizeof(entry), "%c %s%s  %s%s", i == selected ? '>' : ' ', item->is_dir ? "[D] " : "[F] ", item->name,
-                         item_size, item->inaccessible ? "  [permission denied]" : "");
-                if (item->is_duplicate) attron(COLOR_PAIR(7));
+                snprintf(entry, sizeof(entry), "%c %s%s  %s%s%s", i == selected ? '>' : ' ', item->is_dir ? "[D] " : "[F] ", item->name,
+                         item_size, item->is_duplicate ? "  *" : "", item->inaccessible ? "  [permission denied]" : "");
+                if (ui_color_enabled && item->is_duplicate) attron(COLOR_PAIR(7));
                 if (i == selected) attron(A_REVERSE | A_BOLD);
                 else if (item->is_dir) attron(A_BOLD);
-                mvaddnstr(line, 0, entry, cols);
-                attroff(A_REVERSE | A_BOLD | COLOR_PAIR(7));
+                char clipped_entry[PATH_MAX + 64];
+                clip_text(entry, cols, clipped_entry, sizeof(clipped_entry));
+                mvaddnstr(line, 0, clipped_entry, (int)strlen(clipped_entry));
+                attroff(A_REVERSE | A_BOLD | (ui_color_enabled ? COLOR_PAIR(7) : 0));
                 ++shown;
             }
             if (current->child_count && (!filter[0] || name_matches(current->children[selected]->name, filter))) selected_node = current->children[selected];
-            if (filter[0] && !shown && rows - footer_rows > list_start) mvaddnstr(list_start, 0, "No items match the filter", cols);
         } else {
             if (selected >= boxes.count && boxes.count) selected = boxes.count - 1;
             for (size_t i = 0; i < boxes.count; ++i) draw_box(&boxes.items[i], i == selected, 0, pulse_frames > 1);
             if (boxes.count) selected_node = boxes.items[selected].node;
         }
         int status_y = rows - footer_rows;
-        if (selected_node) {
+        if (help_mode) mvaddnstr(status_y, 0, "Help is open  |  ? or Esc closes", cols);
+        else if (selected_node) {
             char selected_size[32], status[PATH_MAX + 96]; format_size(selected_node->size, selected_size, sizeof(selected_size));
-            snprintf(status, sizeof(status), "%s  |  %s%s%s", selected_node->name, selected_size,
+            size_t position = 0, total = 0;
+            for (size_t i = 0; i < current->child_count; ++i) {
+                if (!name_matches(current->children[i]->name, filter)) continue;
+                ++total;
+                if (i == selected) position = total;
+            }
+            snprintf(status, sizeof(status), "%s  |  %s  |  %zu/%zu%s%s", selected_node->name, selected_size, position, total,
                      selected_node->inaccessible ? "  [permission denied]" : "",
                      selected_node->is_duplicate ? "  [duplicate]" : "");
-            mvaddnstr(status_y, 0, status, cols);
-        } else mvaddnstr(status_y, 0, "Directory is empty or inaccessible", cols);
+            char clipped_status[PATH_MAX + 96];
+            clip_text(status, cols, clipped_status, sizeof(clipped_status));
+            mvaddnstr(status_y, 0, clipped_status, (int)strlen(clipped_status));
+        } else if (current->inaccessible) mvaddnstr(status_y, 0, "Cannot read this directory", cols);
+        else if (filter[0]) mvaddnstr(status_y, 0, "No items match the current filter", cols);
+        else if (current->child_count && !visible_items) mvaddnstr(status_y, 0, "Only zero-byte items; list view is enabled", cols);
+        else if (current->child_count) mvaddnstr(status_y, 0, "No visible items in this folder", cols);
+        else mvaddnstr(status_y, 0, "This directory is empty", cols);
         if (footer_rows == 2) {
             char footer[128];
-            snprintf(footer, sizeof(footer), "Sort: %s | Color: %s | [D] folder  [F] file  red=duplicate", sort_name(), color_name());
+            if (help_mode) snprintf(footer, sizeof(footer), "Press ? or Esc to return  |  q quits");
+            else snprintf(footer, sizeof(footer), "Sort: %s | Color: %s | [D] folder  [F] file  %s duplicate", sort_name(), color_name(), ui_color_enabled ? "red=" : "*=");
             mvaddnstr(rows - 1, 0, footer, cols);
         }
         refresh();
@@ -572,24 +924,34 @@ int main(int argc, char **argv) {
         int key = getch();
         if (key == ERR) { --pulse_frames; continue; }
         size_t previous_selection = selected;
-        if (key == 'q' || key == 'Q') { free(boxes.items); break; }
-        if (key == 'l' || key == 'L') { list_mode = !list_mode; selected = 0; }
+        if (key == 'q' || key == 'Q') break;
+        if (key == '?' || (help_mode && key == 27)) help_mode = !help_mode;
+        else if (help_mode) { /* Keep help visible until ? or Escape. */ }
+        else if (key == 'l' || key == 'L') { list_mode = !list_mode; }
         else if (key == 'f' || key == 'F') {
             list_mode = 1; echo(); curs_set(1); mvprintw(rows - 1, 0, "Filter (empty clears): "); clrtoeol(); getnstr(filter, sizeof(filter) - 1); noecho(); curs_set(0); selected = 0;
         }
-        else if (key == 's' || key == 'S') { sort_mode = (sort_mode + 1) % 3; if (current->child_count) qsort(current->children, current->child_count, sizeof(*current->children), compare_nodes); selected = 0; }
-        else if (key == 'c' || key == 'C') { color_mode = (color_mode + 1) % 3; }
+        else if (key == 's' || key == 'S') {
+            Node *anchor = selected_node;
+            sort_mode = (sort_mode + 1) % 3;
+            sort_children(current);
+            if (anchor) selected = child_index(current, anchor);
+        }
+        else if (ui_color_enabled && (key == 'c' || key == 'C')) { color_mode = (color_mode + 1) % 3; }
         else if (show_list && (key == KEY_LEFT || key == KEY_UP)) { if (filter[0]) selected = next_match(current, selected, -1, filter); else if (selected) --selected; }
         else if (show_list && (key == KEY_RIGHT || key == KEY_DOWN)) { if (filter[0]) selected = next_match(current, selected, 1, filter); else if (selected + 1 < current->child_count) ++selected; }
-        else if (show_list && (key == '\n' || key == KEY_ENTER) && selected_node && selected_node->is_dir && !selected_node->inaccessible) { current = selected_node; selected = 0; filter[0] = '\0'; }
+        else if (show_list && (key == '\n' || key == KEY_ENTER) && selected_node && selected_node->is_dir && !selected_node->inaccessible) { current = selected_node; sort_children(current); selected = 0; filter[0] = '\0'; }
         else if (!show_list && (key == KEY_LEFT || key == KEY_UP)) { if (selected) --selected; }
         else if (!show_list && (key == KEY_RIGHT || key == KEY_DOWN)) { if (selected + 1 < boxes.count) ++selected; }
-        else if (!show_list && (key == '\n' || key == KEY_ENTER) && selected_node && selected_node->is_dir && !selected_node->inaccessible) { current = selected_node; selected = 0; filter[0] = '\0'; }
+        else if (!show_list && (key == '\n' || key == KEY_ENTER) && selected_node && selected_node->is_dir && !selected_node->inaccessible) { current = selected_node; sort_children(current); selected = 0; filter[0] = '\0'; }
         else if ((key == KEY_BACKSPACE || key == 127 || key == 8) && current != root) {
-            current = current->parent; selected = 0; filter[0] = '\0';
+            Node *child = current;
+            current = current->parent;
+            selected = child_index(current, child);
+            filter[0] = '\0';
         }
-        pulse_frames = (!list_mode && selected != previous_selection) ? 4 : 0;
-        free(boxes.items);
+        pulse_frames = (!show_list && selected != previous_selection) ? 4 : 0;
     }
-    endwin(); save_state(root->path, sort_mode, color_mode, list_mode); free_duplicate_groups(duplicate_groups, duplicate_group_count); free_node(root); return EXIT_SUCCESS;
+    free(boxes.items);
+    endwin(); ui_active = 0; save_state(root->path, sort_mode, color_mode, list_mode); free_duplicate_groups(duplicate_groups, duplicate_group_count); free_node(root); return EXIT_SUCCESS;
 }
