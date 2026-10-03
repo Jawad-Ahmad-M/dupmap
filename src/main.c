@@ -360,8 +360,16 @@ static Node *scan_path(const char *path, const char *display_name, int is_root) 
             int in_use = 0;
             for (size_t i = 0; i < dir->child_count; ++i)
                 if (!strcmp(dir->children[i]->name, other_name)) { in_use = 1; break; }
-            for (size_t i = 0; i < tiny_count && !in_use; ++i)
-                if (!strcmp(tiny[i]->name, other_name)) in_use = 1;
+            for (size_t i = 0; i < tiny_count && !in_use; ++i) {
+                if (strcmp(tiny[i]->name, other_name)) continue;
+                /* A real entry named like a synthetic group must stay visible
+                   as itself; move it out of the tiny-file group before trying
+                   the next available label. */
+                add_child(dir, tiny[i]);
+                memmove(&tiny[i], &tiny[i + 1], (tiny_count - i - 1) * sizeof(*tiny));
+                --tiny_count;
+                in_use = 1;
+            }
             if (!in_use) break;
             snprintf(other_name, sizeof(other_name), "other (%u)", suffix++);
         }
