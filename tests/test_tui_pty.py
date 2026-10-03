@@ -13,11 +13,11 @@ import time
 
 
 def run_case(program, fixture, columns, rows, show_help, resize_to=None):
-    pid, master = pty.fork()
     env = os.environ.copy()
     env["TERM"] = "xterm-256color"
     with tempfile.TemporaryDirectory(prefix="dupmap-ui-state-") as state_dir:
         env["XDG_STATE_HOME"] = state_dir
+        pid, master = pty.fork()
         if pid == 0:
             fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
             os.execve(program, [program, fixture], env)
@@ -42,7 +42,7 @@ def run_case(program, fixture, columns, rows, show_help, resize_to=None):
                 if not sent and len(output) > 0:
                     os.write(master, b"?" if show_help else b"q")
                     sent = True
-                if show_help and b"Keyboard help" in output and resize_to and not resized:
+                if show_help and b"Help is open" in output and resize_to and not resized:
                     before_resize = len(output)
                     new_columns, new_rows = resize_to
                     fcntl.ioctl(master, termios.TIOCSWINSZ,
