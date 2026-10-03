@@ -88,6 +88,9 @@ Scanning is recursive and follows the directory tree while skipping symlinks.
 Directory sizes are the sum of visible descendant file sizes, not allocated
 disk blocks. Duplicate detection compares file sizes and content hashes, then
 confirms matching contents byte-for-byte. It can take time on large trees.
+Reclaimable space counts distinct file inodes, keeps one copy, and excludes
+data retained by hard links outside the duplicate group. These totals use the
+scanned logical sizes; filesystem changes after scanning can invalidate them.
 Files smaller than 4 KiB are grouped into `other` folders in the display.
 
 View state is stored in `${XDG_STATE_HOME:-~/.config}/dupmap/state`. State is

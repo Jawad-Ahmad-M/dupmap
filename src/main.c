@@ -47,6 +47,9 @@ struct Node {
     int inaccessible;
     int is_duplicate;
     time_t modified;
+    dev_t device;
+    ino_t inode;
+    nlink_t link_count;
     size_t file_count;
     Node **children;
     size_t child_count;
@@ -447,6 +450,41 @@ static void free_duplicate_groups(DuplicateGroup *groups, size_t count) {
     free(groups);
 }
 
+static int compare_file_identity(const void *a, const void *b) {
+    const Node *left = *(const Node * const *)a, *right = *(const Node * const *)b;
+    if (left->device < right->device) return -1;
+    if (left->device > right->device) return 1;
+    if (left->inode < right->inode) return -1;
+    if (left->inode > right->inode) return 1;
+    return 0;
+}
+
+/* An inode can release its data only when every hard link is removed.
+   Keep one copy, preferring an inode whose links extend outside this group. */
+static off_t duplicate_reclaimable_size(const DuplicateGroup *group) {
+    if (group->count < 2 || group->size <= 0) return 0;
+    if (group->count > SIZE_MAX / sizeof(Node *)) die("too many duplicate files");
+    Node **files = malloc(group->count * sizeof(*files));
+    if (!files) die("out of memory");
+    memcpy(files, group->files, group->count * sizeof(*files));
+    qsort(files, group->count, sizeof(*files), compare_file_identity);
+    size_t inodes = 0, reclaimable = 0;
+    for (size_t first = 0; first < group->count;) {
+        size_t end = first + 1;
+        while (end < group->count && files[end]->device == files[first]->device &&
+               files[end]->inode == files[first]->inode) ++end;
+        ++inodes;
+        if (files[first]->link_count && end - first == files[first]->link_count)
+            ++reclaimable;
+        first = end;
+    }
+    free(files);
+    if (reclaimable == inodes) --reclaimable;
+    off_t max_size = max_off_t_value();
+    return reclaimable > (uintmax_t)(max_size / group->size)
+        ? max_size : group->size * (off_t)reclaimable;
+}
+
 /* Build an owned tree from lstat results. Symlinks and special files are
    excluded; directories are opened without following the final path component
    and checked against lstat to avoid scanning a swapped directory. */
@@ -462,6 +500,9 @@ static Node *scan_path(const char *path, const char *display_name, int is_root) 
         Node *file = new_node(display_name, path, 0);
         file->size = st.st_size;
         file->modified = st.st_mtime;
+        file->device = st.st_dev;
+        file->inode = st.st_ino;
+        file->link_count = st.st_nlink;
         return file;
     }
 
@@ -1100,10 +1141,7 @@ int main(int argc, char **argv) {
         DuplicateGroup *groups = NULL; size_t group_count = find_duplicate_groups(root, &groups);
         printf("Duplicate groups: %zu\n", group_count);
         for (size_t i = 0; i < group_count; ++i) {
-            size_t copies = groups[i].count - 1;
-            off_t max_size = max_off_t_value();
-            off_t reclaimable = groups[i].size > 0 && copies > (size_t)(max_size / groups[i].size)
-                                  ? max_size : groups[i].size * (off_t)copies;
+            off_t reclaimable = duplicate_reclaimable_size(&groups[i]);
             char size_text[32]; format_size(reclaimable, size_text, sizeof(size_text));
             printf("\n%s reclaimable (%zu files):\n", size_text, groups[i].count);
             for (size_t j = 0; j < groups[i].count; ++j) {
