@@ -535,11 +535,13 @@ static Node *scan_path(const char *path, const char *display_name, int is_root) 
             if (!in_use) break;
             snprintf(other_name, sizeof(other_name), "other (%u)", suffix++);
         }
-        char *other_path = join_path(path, other_name);
-        Node *other = new_node(other_name, other_path, 1);
-        free(other_path);
-        for (size_t i = 0; i < tiny_count; ++i) add_child(other, tiny[i]);
-        add_child(dir, other);
+        if (tiny_count) {
+            char *other_path = join_path(path, other_name);
+            Node *other = new_node(other_name, other_path, 1);
+            free(other_path);
+            for (size_t i = 0; i < tiny_count; ++i) add_child(other, tiny[i]);
+            add_child(dir, other);
+        }
     }
     free(tiny);
     sort_children(dir);

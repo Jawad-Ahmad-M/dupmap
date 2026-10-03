@@ -20,7 +20,7 @@ static Node *find_child(Node *parent, const char *name) {
     return NULL;
 }
 
-static void test_tiny_group_name_does_not_shadow_existing_entry(void) {
+static void test_tiny_group_name_does_not_shadow_existing_entry(int with_tiny_file) {
     char path[] = "/tmp/dupmap-names-XXXXXX";
     assert(mkdtemp(path));
     char entry[PATH_MAX];
@@ -30,19 +30,32 @@ static void test_tiny_group_name_does_not_shadow_existing_entry(void) {
     assert(mkdir(entry, 0700) == 0);
     snprintf(entry, sizeof(entry), "%s/large.bin", path);
     write_file(entry, 5000, 'y');
+    if (with_tiny_file) {
+        snprintf(entry, sizeof(entry), "%s/tiny.txt", path);
+        write_file(entry, 7, 'z');
+    }
 
     Node *root = scan_path(path, path, 1);
     assert(root);
     assert(find_child(root, "other"));
     assert(!find_child(root, "other")->is_dir);
-    assert(find_child(root, "other (3)"));
-    assert(find_child(root, "other (3)")->is_dir);
-    assert(find_child(root, "other (3)")->size == 3);
+    assert(find_child(root, "other")->size == 3);
+    Node *group = find_child(root, "other (3)");
+    if (with_tiny_file) {
+        assert(group && group->is_dir && group->size == 7);
+        assert(group->file_count == 1);
+        assert(find_child(group, "tiny.txt"));
+    } else assert(!group);
+    assert(root->size == 5003 + (with_tiny_file ? 7 : 0));
+    assert(root->file_count == (size_t)(2 + with_tiny_file));
     free_node(root);
 
     snprintf(entry, sizeof(entry), "%s/other", path); unlink(entry);
     snprintf(entry, sizeof(entry), "%s/other (2)", path); rmdir(entry);
     snprintf(entry, sizeof(entry), "%s/large.bin", path); unlink(entry);
+    if (with_tiny_file) {
+        snprintf(entry, sizeof(entry), "%s/tiny.txt", path); unlink(entry);
+    }
     rmdir(path);
 }
 
@@ -235,7 +248,8 @@ static void test_layout_dimension_sweep_and_large_units(void) {
 }
 
 int main(void) {
-    test_tiny_group_name_does_not_shadow_existing_entry();
+    test_tiny_group_name_does_not_shadow_existing_entry(0);
+    test_tiny_group_name_does_not_shadow_existing_entry(1);
     test_root_symlink_is_not_scanned();
     test_aggregate_counters_saturate();
     test_filter_matching_and_wraparound();
