@@ -1064,7 +1064,7 @@ int main(int argc, char **argv) {
     if (!dupes_mode) {
         if (!initscr()) { fprintf(stderr, "dupmap: cannot initialize terminal UI\n"); return EXIT_FAILURE; }
         ui_active = 1; cbreak(); noecho(); keypad(stdscr, TRUE); curs_set(0);
-        ui_color_enabled = has_colors() && COLOR_PAIRS > 9 && start_color() != ERR;
+        ui_color_enabled = has_colors() && start_color() != ERR && COLOR_PAIRS > 9;
         if (ui_color_enabled) {
             int color_setup_ok = 1;
             for (int i = 1; i <= 6; ++i) {

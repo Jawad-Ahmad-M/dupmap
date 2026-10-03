@@ -12,9 +12,10 @@ import termios
 import time
 
 
-def run_case(program, fixture, columns, rows, show_help, resize_to=None):
+def run_case(program, fixture, columns, rows, show_help, resize_to=None,
+             terminal="xterm-256color", expected_color=None):
     env = os.environ.copy()
-    env["TERM"] = "xterm-256color"
+    env["TERM"] = terminal
     with tempfile.TemporaryDirectory(prefix="dupmap-ui-state-") as state_dir:
         env["XDG_STATE_HOME"] = state_dir
         pid, master = pty.fork()
@@ -71,6 +72,10 @@ def run_case(program, fixture, columns, rows, show_help, resize_to=None):
                     f"TUI exited {return_code} at {columns}x{rows}; "
                     f"terminal output: {bytes(output[-2000:])!r}"
                 )
+            if expected_color is not None:
+                color_status = b"Color: depth" if expected_color else b"Color: mono"
+                if color_status not in output:
+                    raise AssertionError(f"Expected {color_status!r} on {terminal}")
         finally:
             try:
                 waited, _ = os.waitpid(pid, os.WNOHANG)
@@ -87,7 +92,8 @@ def main():
         raise SystemExit("usage: test_tui_pty.py DUPMAP FIXTURE")
     program = os.path.abspath(sys.argv[1])
     fixture = os.path.abspath(sys.argv[2])
-    run_case(program, fixture, 80, 24, True, resize_to=(47, 11))
+    run_case(program, fixture, 80, 24, True, resize_to=(47, 11), expected_color=True)
+    run_case(program, fixture, 80, 24, False, terminal="vt100", expected_color=False)
     run_case(program, fixture, 47, 11, False)
     run_case(program, fixture, 15, 5, False)
     print("pseudo-terminal UI tests: all passed")
