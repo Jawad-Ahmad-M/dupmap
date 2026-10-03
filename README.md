@@ -37,6 +37,10 @@ Run the scanner, duplicate, layout, edge-case, and fixture CLI checks with
 `ctest --test-dir build-cmake --output-on-failure`. On GCC or Clang, `make sanitize` runs the checks with
 AddressSanitizer and UndefinedBehaviorSanitizer enabled.
 
+For hands-on visual checks, run `make lab` or `bash project_testing/run.sh`.
+It opens generated edge-case datasets in the TUI and gives you a checklist for
+each one. See [`project_testing/README.md`](project_testing/README.md).
+
 ## Use
 
 ```sh

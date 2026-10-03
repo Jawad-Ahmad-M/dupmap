@@ -1,33 +1,63 @@
-# dupmap test fixture
+# dupmap testing lab
 
-This directory is a deterministic integration fixture for testing the scanner,
-duplicate report, filename handling, and nested paths. `make test` runs the
-fixture CLI checks automatically. To inspect it manually, run dupmap against
-this directory, not the repository root:
+This folder is for hands-on visual checks. It includes fixed sample data and an
+interactive runner that builds one isolated scenario at a time, opens it in
+dupmap, and tells you what to inspect. The temporary data is removed when you
+exit the app.
+
+From the repository root, build and run the lab:
 
 ```sh
-./dupmap --dupes project_testing
+make
+bash project_testing/run.sh
+```
+
+Use arrow keys to move, Enter to open folders, Backspace to go up, `l` to
+switch between treemap and list views, and `q` to close dupmap. Press `?` for
+the full key guide. In list view, try filtering with `f`; try sorting with `s`
+and color modes with `c` where supported. While a case is open, resize the
+terminal window in both directions. Try a small terminal, then a normal or
+wide one; the layout should adapt without losing selection or clipping tiles
+outside the view. Press Enter after quitting dupmap to choose another case.
+All generated files live in a temporary directory.
+
+## Manual scenarios
+
+| Runner choice | Checks | What should happen |
+| --- | --- | --- |
+| Empty folder | Empty-state view | No crash or stray tiles; navigation and quit still work. |
+| Tiny-file boundaries | 0, 1, 4095, 4096, and 4097 byte files | Files below 4096 bytes appear inside a synthetic `other` folder; 4096 and 4097 byte files remain separate. |
+| Generated-name collision | Tiny file `other`, real directory `other (2)` | Both real entries stay intact; the synthetic tiny-file folder is named `other (3)`. |
+| Crowded directory | 300 entries with varied sizes | Tiles stay within bounds. At cramped sizes use list view; resizing should redraw cleanly. |
+| Duplicate and near-match files | Identical content, empty duplicates, same-size different content | Identical files are marked; equal-size files with different bytes are not. Enter folders to inspect grouped tiny files. |
+| Deep directory tree | 24 nested folders and a spaced filename | Enter/Backspace navigation works and the path remains readable. |
+| Spaces, Unicode, and long filename | `café-東京.txt`, spaces, 180-character name | Names clip cleanly without corrupting the display or breaking selection. |
+
+The runner creates each scenario from scratch, so cases do not affect each
+other. If you want to inspect fixed integration data instead, run:
+
+```sh
 ./dupmap project_testing
+./dupmap --dupes project_testing
 ```
 
-Expected duplicate groups before running the setup script:
+Fixed fixture groups include duplicate files, empty files, same-size different
+content, nested paths, Unicode, and tiny files. Optional Linux-only symlink
+and unreadable-directory fixtures can be enabled with
+`bash project_testing/setup_edge_cases.sh`; restore them as described in that
+script before deleting the fixture.
 
-- `duplicates/group-a`: three identical files, one reclaimable group
-- `duplicates/group-b`: two identical files with spaces in their names
-- `duplicates/large`: two identical files larger than the tiny-file threshold
-- `same-size-different-content`: no duplicate group
-- `empty`: two identical empty files, one duplicate group
+## Automated checks
 
-Run the optional Linux-only symlink and permissions setup from the repository root:
+The manual lab complements the regression suite; it does not replace it. From
+the repository root run:
 
 ```sh
-bash project_testing/setup_edge_cases.sh
+make test
+make sanitize
 ```
 
-That creates a symlink and makes one directory unreadable. It only changes
-paths inside `project_testing/` and can be restored with:
-
-```sh
-chmod u+rX project_testing/permissions/blocked
-rm -f project_testing/symlinks/link-to-original
-```
+The suite covers scanner aggregation, duplicate detection, layout bounds and
+terminal-size sweeps, filesystem edge cases, fixture CLI behavior, and
+pseudo-terminal navigation/resize/filter/sort/quit behavior. See
+[`../tests/README.md`](../tests/README.md) for the automated coverage details.

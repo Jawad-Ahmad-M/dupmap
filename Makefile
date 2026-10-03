@@ -22,6 +22,9 @@ test: tests/test_core.c tests/test_duplicates.c tests/test_layout_dimensions.c t
 	sh tests/test_fixture_cli.sh ./dupmap project_testing
 	@if command -v python3 >/dev/null 2>&1; then case "$$(uname -s)" in MINGW*|MSYS*|CYGWIN*) echo "Skipping pseudo-terminal UI checks (POSIX PTY required)";; *) python3 tests/test_tui_pty.py ./dupmap project_testing;; esac; else echo "Skipping pseudo-terminal UI checks (Python 3 required)"; fi
 
+lab: dupmap
+	bash project_testing/run.sh
+
 sanitize:
 	$(MAKE) clean
 	$(MAKE) CFLAGS="-std=c11 -Wall -Wextra -Wpedantic -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" test
@@ -33,4 +36,4 @@ install: dupmap
 clean:
 	rm -f dupmap build/test_core build/test_duplicates build/test_layout_dimensions build/test_edge_cases
 
-.PHONY: clean test sanitize install
+.PHONY: clean test sanitize lab install
